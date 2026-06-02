@@ -17,6 +17,7 @@ log = logging.getLogger("slopsmith.lib.retune")
 
 from patcher import unpack_psarc, pack_psarc
 from audio import _vgmstream_cmd
+from song import _convert_sng_to_xml
 
 RSCLI = Path(os.environ.get("RSCLI_PATH", str(Path(__file__).parent / "tools" / "rscli" / "RsCli")))
 
@@ -168,6 +169,79 @@ def _pitch_shift_wem(wem_path: Path, semitones: int, on_progress=None) -> bool:
     return True
 
 
+def _is_instrumental_sng(sng_path: Path) -> bool:
+    stem = sng_path.stem.lower()
+    if "vocals" in stem or "showlights" in stem or "jvocals" in stem:
+        return False
+    return True
+
+
+def _require_rscli() -> Path:
+    if RSCLI.exists():
+        return RSCLI
+    raise RuntimeError(
+        "RsCli is required to retune SNG-only CDLC (RsCli not found). "
+        f"Set RSCLI_PATH (expected: {RSCLI})"
+    )
+
+
+def _ensure_arrangement_xmls(tmp: Path) -> None:
+    """Ensure songs/arr/{stem}.xml exist for instrumental SNGs (SNG-only CDLC)."""
+    sng_files = [p for p in sorted(tmp.rglob("*.sng")) if _is_instrumental_sng(p)]
+    if not sng_files:
+        return
+
+    arr_dir = tmp / "songs" / "arr"
+    missing = [s for s in sng_files if not (arr_dir / f"{s.stem}.xml").exists()]
+    if not missing:
+        return
+
+    _require_rscli()
+    log.info("Converting %d arrangement SNG(s) to XML for retune...", len(missing))
+    _convert_sng_to_xml(str(tmp))
+
+    still_missing = [s.name for s in missing if not (arr_dir / f"{s.stem}.xml").exists()]
+    if still_missing:
+        raise RuntimeError(
+            "Failed to convert arrangement SNG to XML (sng2xml): " + ", ".join(still_missing)
+        )
+
+
+def _recompile_sngs_from_xml(tmp: Path, on_progress=None) -> None:
+    """Write updated tuning from songs/arr/*.xml back into matching SNG binaries."""
+    rscli = _require_rscli()
+    for xml_path in sorted(tmp.rglob("songs/arr/*.xml")):
+        try:
+            root = ET.parse(xml_path).getroot()
+        except ET.ParseError:
+            continue
+        if root.tag != "song":
+            continue
+        arr = root.find("arrangement")
+        if arr is not None and arr.text:
+            low = arr.text.lower().strip()
+            if low in ("vocals", "showlights", "jvocals"):
+                continue
+
+        stem = xml_path.stem
+        sng_path = tmp / "songs" / "bin" / "generic" / f"{stem}.sng"
+        if not sng_path.exists():
+            continue
+
+        log.info("Recompiling SNG: %s", stem)
+        if on_progress:
+            on_progress(f"Recompiling SNG: {stem}", 80)
+        result = subprocess.run(
+            [str(rscli), "xml2sng", str(xml_path), str(sng_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-500:]
+            raise RuntimeError(f"xml2sng failed for {stem}: {detail}")
+
+
 def retune_to_standard(psarc_path: str, output_path: str = "", on_progress=None) -> str:
     """Pitch-shift a CDLC to E standard tuning.
 
@@ -202,6 +276,9 @@ def retune_to_standard(psarc_path: str, output_path: str = "", on_progress=None)
         log.info("Extracting PSARC...")
         unpack_psarc(psarc_path, str(tmp))
 
+        # SNG-only CDLC: materialize songs/arr/*.xml before tuning edits / xml2sng.
+        _ensure_arrangement_xmls(tmp)
+
         # Pitch-shift all audio files
         shifted_count = 0
         for wem in sorted(tmp.rglob("*.wem")):
@@ -235,32 +312,8 @@ def retune_to_standard(psarc_path: str, output_path: str = "", on_progress=None)
                 if on_progress:
                     on_progress(f"Updated tuning: {xml_path.name}", 70)
 
-        # Recompile SNGs from updated XMLs
-        if RSCLI.exists():
-            for xml_path in sorted(tmp.rglob("songs/arr/*.xml")):
-                try:
-                    tree = ET.parse(xml_path)
-                    root = tree.getroot()
-                except ET.ParseError:
-                    continue
-                if root.tag != "song":
-                    continue
-                arr = root.find("arrangement")
-                if arr is not None and arr.text:
-                    low = arr.text.lower().strip()
-                    if low in ("vocals", "showlights", "jvocals"):
-                        continue
-
-                stem = xml_path.stem
-                sng_path = tmp / "songs" / "bin" / "generic" / f"{stem}.sng"
-                if sng_path.exists():
-                    log.info("Recompiling SNG: %s", stem)
-                    if on_progress:
-                        on_progress(f"Recompiling SNG: {stem}", 80)
-                    subprocess.run(
-                        [str(RSCLI), "xml2sng", str(xml_path), str(sng_path)],
-                        capture_output=True,
-                    )
+        # Recompile SNGs from updated XMLs (fail if any instrumental xml2sng fails).
+        _recompile_sngs_from_xml(tmp, on_progress=on_progress)
 
         # Update JSON manifests
         for json_path in sorted(tmp.rglob("*.json")):
