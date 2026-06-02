@@ -17,7 +17,6 @@ log = logging.getLogger("slopsmith.lib.retune")
 
 from patcher import unpack_psarc, pack_psarc
 from audio import _vgmstream_cmd
-from song import _convert_sng_to_xml
 
 RSCLI = Path(os.environ.get("RSCLI_PATH", str(Path(__file__).parent / "tools" / "rscli" / "RsCli")))
 
@@ -176,13 +175,52 @@ def _is_instrumental_sng(sng_path: Path) -> bool:
     return True
 
 
+def _rscli_candidates() -> list[Path]:
+    """Candidate RsCli paths aligned with song._convert_sng_to_xml discovery."""
+    candidates: list[Path] = []
+    if "RESOURCESPATH" in os.environ:
+        candidates.append(Path(os.environ["RESOURCESPATH"]) / "bin" / "rscli" / "RsCli")
+    env = os.environ.get("RSCLI_PATH", "").strip()
+    if env:
+        candidates.append(Path(env))
+    candidates.append(RSCLI)
+    candidates.append(Path(__file__).parent.parent / "tools" / "rscli" / "RsCli")
+    path_bin = os.environ.get("PATH_BIN", "").strip()
+    if path_bin:
+        candidates.append(Path(path_bin) / "rscli" / "RsCli")
+    candidates.extend([
+        Path("/opt/rscli/RsCli"),
+        Path("./rscli/RsCli"),
+    ])
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for p in candidates:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(p)
+    return ordered
+
+
 def _require_rscli() -> Path:
-    if RSCLI.exists():
-        return RSCLI
+    tried: list[str] = []
+    for candidate in _rscli_candidates():
+        tried.append(str(candidate))
+        if candidate.exists():
+            return candidate
     raise RuntimeError(
         "RsCli is required to retune SNG-only CDLC (RsCli not found). "
-        f"Set RSCLI_PATH (expected: {RSCLI})"
+        f"Set RSCLI_PATH or install RsCli. Searched: {', '.join(tried)}"
     )
+
+
+def _sng_platform(sng_paths: list[Path]) -> str:
+    for sng_path in sng_paths:
+        parts = str(sng_path).lower()
+        if "/macos/" in parts or "/mac/" in parts:
+            return "mac"
+    return "pc"
 
 
 def _ensure_arrangement_xmls(tmp: Path) -> None:
@@ -196,9 +234,22 @@ def _ensure_arrangement_xmls(tmp: Path) -> None:
     if not missing:
         return
 
-    _require_rscli()
+    rscli = _require_rscli()
+    arr_dir.mkdir(parents=True, exist_ok=True)
+    platform = _sng_platform(sng_files)
     log.info("Converting %d arrangement SNG(s) to XML for retune...", len(missing))
-    _convert_sng_to_xml(str(tmp))
+
+    for sng_path in missing:
+        xml_out = arr_dir / f"{sng_path.stem}.xml"
+        result = subprocess.run(
+            [str(rscli), "sng2xml", str(sng_path), str(xml_out), platform],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-500:]
+            raise RuntimeError(f"sng2xml failed for {sng_path.name}: {detail}")
 
     still_missing = [s.name for s in missing if not (arr_dir / f"{s.stem}.xml").exists()]
     if still_missing:
