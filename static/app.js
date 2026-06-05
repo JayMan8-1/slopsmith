@@ -994,6 +994,9 @@ async function showScreen(id) {
         }
         loadSettings();
     }
+    if (id === 'player') {
+        _ensureSpeedSliderWired();
+    }
     if (id !== 'player') {
         const audio = document.getElementById('audio');
         const stopTime = _audioTime();
@@ -4820,9 +4823,12 @@ audio.addEventListener('pause', () => {
 
 // Abort controller for cancelling pending requests when entering player
 let artAbortController = null;
+// Monotonic token so overlapping playSong() calls don't each open a WS.
+let _playSongSeq = 0;
 
 async function playSong(filename, arrangement, options) {
-    console.log('playSong called:', filename);
+    const loadSeq = ++_playSongSeq;
+    console.log('playSong called:', filename, 'seq', loadSeq);
     if (!options || options.bridge !== false) {
         _recordPlaybackBridge('playback.window-play-song', 'window.playSong', 'legacy playSong entry point used');
     }
@@ -4872,6 +4878,9 @@ async function playSong(filename, arrangement, options) {
     document.getElementById('speed-slider').value = 100;
     handleSliderInput(document.getElementById('speed-slider'));
     document.getElementById('speed-label').textContent = '1.0x';
+    _updateSpeedQualityHint(1);
+    _updateSpeedPresetButtons(100);
+    _ensureSpeedSliderWired();
     clearLoop();
 
     currentFilename = filename;
@@ -4886,6 +4895,10 @@ async function playSong(filename, arrangement, options) {
 
     // Wait for previous WebSocket to fully close before opening new one
     await new Promise(r => setTimeout(r, 500));
+    if (loadSeq !== _playSongSeq) {
+        console.log('[arr] playSong superseded before connect', filename);
+        return;
+    }
     highway.init(document.getElementById('highway'));
 
     const wsParams = new URLSearchParams();
@@ -4905,6 +4918,7 @@ let _arrBusyGen = 0;
 let _arrBusyTimeout = null;
 
 async function changeArrangement(index) {
+    console.log('[arr] selected', index);
     if (currentFilename) {
         window.slopsmith.emit('song:arrangement-changed', { filename: currentFilename, arrangement: index });
         const wasPlaying = isPlaying;
@@ -5007,7 +5021,9 @@ async function changeArrangement(index) {
                         window.slopsmith.emit('song:play', payload);
                         window.slopsmith.emit('song:resume', payload);
                     }
-                } else audio.play().then(() => { isPlaying = true; }).catch(() => {});
+                } else if (audio.src && audio.src !== window.location.href) {
+                    audio.play().then(() => { isPlaying = true; }).catch(() => {});
+                }
             }
             clearBusy();
             clearMyCallback();
@@ -5048,6 +5064,12 @@ async function togglePlay() {
         audio.pause(); isPlaying = false;
         setPlayButtonState(false);
     } else {
+        // After JUCE routing, audio.src is cleared — play() would reject with
+        // NotSupportedError even though backing is handled natively.
+        if (!audio.src || audio.src === window.location.href) {
+            console.warn('[audio] HTML5 play skipped — no source (use JUCE backing)');
+            return;
+        }
         // Flip the UI optimistically before awaiting the play() Promise so
         // a quick second click during a slow start (buffering, device
         // wake, etc.) still enters the pause branch above. Two stale-
@@ -5077,29 +5099,205 @@ async function togglePlay() {
 async function seekBy(s) {
     await _audioSeek(Math.max(0, _audioTime() + s), 'seek-by');
 }
-function setSpeed(v) {
+
+/** True when song backing is routed through the desktop JUCE engine. */
+function _useJuceBacking() {
+    return !!(window._juceMode || window._juceAudioUrl);
+}
+
+// ── Playback speed UX — V1 stable core (SoundTouch realtime; engine-swappable) ──
+/** Locked V1 musician practice targets — primary workflow. */
+const SPEED_PRESET_PCTS = [100, 90, 80, 75, 70, 60, 50];
+const SPEED_SWEET_SPOT_PCTS = [80, 75, 70];
+const SPEED_SNAP_THRESHOLD = 0.02;
+const SPEED_SLIDER_MIN = 25;
+const SPEED_SLIDER_MAX = 150;
+
+function _speedSliderPosPct(pct) {
+    return ((pct - SPEED_SLIDER_MIN) / (SPEED_SLIDER_MAX - SPEED_SLIDER_MIN)) * 100;
+}
+
+function _initSpeedSliderTicks() {
+    const wrap = document.getElementById('speed-slider-ticks');
+    if (!wrap || wrap.dataset.built === '1') return;
+    wrap.dataset.built = '1';
+    const sweetLo = Math.min(...SPEED_SWEET_SPOT_PCTS);
+    const sweetHi = Math.max(...SPEED_SWEET_SPOT_PCTS);
+    const band = document.createElement('div');
+    band.className = 'speed-slider-sweetspot';
+    band.style.left = _speedSliderPosPct(sweetLo) + '%';
+    band.style.width = (_speedSliderPosPct(sweetHi) - _speedSliderPosPct(sweetLo)) + '%';
+    wrap.appendChild(band);
+    for (const pct of SPEED_PRESET_PCTS) {
+        const tick = document.createElement('span');
+        const isSweet = pct >= sweetLo && pct <= sweetHi;
+        tick.className = 'speed-slider-tick' + (isSweet ? ' speed-slider-tick-sweet' : '');
+        tick.style.left = _speedSliderPosPct(pct) + '%';
+        wrap.appendChild(tick);
+    }
+}
+
+function _speedQualityLabel(rate) {
+    if (rate >= 0.8) return 'High Quality';
+    if (rate >= 0.6) return 'Practice Quality';
+    return 'Extreme Slowdown';
+}
+
+function _snapSpeedRate(rate) {
+    if (!Number.isFinite(rate)) return rate;
+    for (const pct of SPEED_PRESET_PCTS) {
+        const preset = pct / 100;
+        if (Math.abs(rate - preset) <= SPEED_SNAP_THRESHOLD) return preset;
+    }
+    return rate;
+}
+
+function _updateSpeedQualityHint(rate) {
+    const hint = document.getElementById('speed-quality-hint');
+    if (!hint) return;
+    const next = _speedQualityLabel(rate);
+    if (hint.textContent === next) return;
+    hint.classList.add('speed-quality-hint-fade');
+    requestAnimationFrame(() => {
+        hint.textContent = next;
+        hint.classList.remove('speed-quality-hint-fade');
+    });
+}
+
+function _updateSpeedPresetButtons(activePct) {
+    const wrap = document.getElementById('speed-presets');
+    if (!wrap) return;
+    const target = Number.isFinite(activePct) ? Math.round(activePct) : null;
+    for (const btn of wrap.querySelectorAll('[data-speed-preset]')) {
+        const pct = Number(btn.dataset.speedPreset);
+        btn.classList.toggle('speed-preset-active', target !== null && pct === target);
+    }
+}
+
+function applySpeedPreset(percent) {
+    const slider = document.getElementById('speed-slider');
+    if (!slider) return;
+    const pct = Math.max(Number(slider.min) || 25, Math.min(Number(slider.max) || 150, Number(percent)));
+    slider.value = String(pct);
+    handleSliderInput(slider);
+    _updateSpeedPresetButtons(pct);
+    void setSpeed(pct / 100);
+}
+window.applySpeedPreset = applySpeedPreset;
+
+// Public hook for future engines (Rubber Band, Elastique, offline stretch, etc.).
+window.slopsmithPlayback = window.slopsmithPlayback || {};
+window.slopsmithPlayback.speed = {
+    engine: 'soundtouch-realtime',
+    profile: 'musician-practice-v1',
+    availableEngines: ['soundtouch-realtime'],
+    presets: SPEED_PRESET_PCTS,
+    sweetSpot: SPEED_SWEET_SPOT_PCTS,
+    snapThreshold: SPEED_SNAP_THRESHOLD,
+    setRate(rate) { return setSpeed(rate); },
+    applyPreset(percent) { applySpeedPreset(percent); },
+    snapRate(rate) { return _snapSpeedRate(rate); },
+    qualityLabel(rate) { return _speedQualityLabel(rate); },
+};
+
+async function setSpeed(v) {
     const speedSlider = document.getElementById('speed-slider');
     const rate = Number(v);
-    if (!Number.isFinite(rate)) {
+    console.log('[setSpeed]', rate);
+    if (!Number.isFinite(rate) || rate <= 0) {
+        console.warn('[setSpeed] ignored invalid rate:', v);
         return;
-    }
-    if (window._juceMode) {
-        window.jucePlayer?.setRate(rate);
-        const juceAudio = window.slopsmithDesktop?.audio;
-        Promise.resolve()
-            .then(() => juceAudio?.setBackingSpeed(rate))
-            // Match the HTML5 path: preserve pitch on the JUCE backing track too.
-            // Optional-chained call is a no-op on desktop builds that predate
-            // setBackingPreservePitch, so this is safe to ship unconditionally.
-            .then(() => juceAudio?.setBackingPreservePitch?.(true))
-            .catch(err => console.warn('[setSpeed] backing speed/preserve-pitch failed:', err));
-    } else {
-        audio.playbackRate = rate;
     }
     const speedLabel = document.getElementById('speed-label');
     if (speedLabel) speedLabel.textContent = rate.toFixed(2) + 'x';
+    _updateSpeedQualityHint(rate);
+    _updateSpeedPresetButtons(Math.round(rate * 100));
     handleSliderInput(speedSlider);
+
+    const useJuce = _useJuceBacking();
+    if (useJuce) {
+        window.jucePlayer?.setRate(rate);
+        const juceAudio = window.slopsmithDesktop?.audio;
+        const setBackingSpeed = juceAudio?.setBackingSpeed;
+        if (typeof setBackingSpeed !== 'function') {
+            console.warn('[setSpeed] JUCE backing active but audio.setBackingSpeed is unavailable');
+            return;
+        }
+        window._lastBackingSpeedReq = rate;
+        try {
+            const ok = await setBackingSpeed(rate);
+            console.log('[setSpeed] setBackingSpeed →', ok);
+            if (ok === false) {
+                console.warn('[setSpeed] native engine rejected speed', rate);
+            }
+            await juceAudio?.setBackingPreservePitch?.(true);
+        } catch (err) {
+            console.warn('[setSpeed] backing speed/preserve-pitch failed:', err);
+        }
+        return;
+    }
+    audio.playbackRate = rate;
+    if ('preservesPitch' in audio) audio.preservesPitch = true;
 }
+window.setSpeed = setSpeed;
+
+function _ensureSpeedSliderWired() {
+    if (window.__speedSliderWired) return;
+    window.__speedSliderWired = true;
+    const slider = document.getElementById('speed-slider');
+    if (!slider) return;
+
+    const presets = document.getElementById('speed-presets');
+    if (presets && !presets._speedPresetsWired) {
+        presets._speedPresetsWired = true;
+        presets.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-speed-preset]');
+            if (!btn) return;
+            applySpeedPreset(Number(btn.dataset.speedPreset));
+        });
+    }
+
+    slider.addEventListener('pointerdown', () => {
+        console.log('[slider] pointerdown');
+    });
+    slider.addEventListener('input', (e) => {
+        const rate = Number(e.target.value) / 100;
+        console.log('[slider] input', e.target.value);
+        _updateSpeedQualityHint(rate);
+        void setSpeed(rate);
+    });
+    slider.addEventListener('change', (e) => {
+        let pct = Number(e.target.value);
+        const snapped = _snapSpeedRate(pct / 100);
+        if (Math.abs(snapped - pct / 100) > 1e-6) {
+            pct = Math.round(snapped * 100);
+            e.target.value = String(pct);
+            handleSliderInput(e.target);
+        }
+        console.log('[slider] change', e.target.value);
+        // Final `input` on release already applied this rate — avoid a second bridge invoke.
+        if (window._lastBackingSpeedReq === snapped) return;
+        void setSpeed(snapped);
+    });
+
+    _initSpeedSliderTicks();
+    _updateSpeedQualityHint(Number(slider.value) / 100);
+    _updateSpeedPresetButtons(Number(slider.value));
+}
+
+window.debugSliderHitTest = () => {
+    const slider = document.getElementById('speed-slider');
+    if (!slider) return console.log('missing slider');
+
+    const r = slider.getBoundingClientRect();
+
+    const el = document.elementFromPoint(
+        r.left + r.width / 2,
+        r.top + r.height / 2
+    );
+
+    console.log('[slider hit test]', el);
+};
 // Master-difficulty slider (slopsmith#48). Persists partial via
 // /api/settings — the POST handler merges only the keys present, so
 // this fire-and-forget call doesn't clobber dlc_dir or other settings.
@@ -6023,7 +6221,7 @@ async function startCountIn() {
                         window.slopsmith.emit('song:play', payload);
                         window.slopsmith.emit('song:resume', payload);
                     }).catch((err) => console.error('[app] jucePlayer.play error:', err));
-                } else {
+                } else if (audio.src && audio.src !== window.location.href) {
                     audio.play().then(() => {
                         if (gen !== _countInGen) return;
                         isPlaying = true;
@@ -7835,6 +8033,7 @@ async function bootstrapPluginsAndUi() {
     // loadSettings) before the first playSong, or follower windows that
     // enter the player screen via showScreen('player') without playSong.
     document.querySelectorAll('.slider-input').forEach(el => handleSliderInput(el));
+    _ensureSpeedSliderWired();
     checkScanAndLoad();
 
     const plugins = await bootstrapPluginsAndUi();

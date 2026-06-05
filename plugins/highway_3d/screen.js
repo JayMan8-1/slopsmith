@@ -4195,7 +4195,9 @@
             wrap.id = 'h3d-wrap-' + _instanceId;
             wrap.className = 'h3d-wrap';
             wrap.dataset.h3dInstance = String(_instanceId);
-            wrap.style.cssText = 'position:absolute;top:0;left:0;right:0;z-index:2;pointer-events:none;';
+            const _controlsH = document.getElementById('player-controls')?.offsetHeight || 120;
+            wrap.style.cssText = 'position:absolute;top:0;left:0;right:0;z-index:2;pointer-events:none;bottom:'
+                + _controlsH + 'px;';
             // Mark this instance as the primary tour target so the tour engine
             // always spotlights a unique element (selector '.h3d-wrap[data-h3d-primary]')
             // rather than the first of potentially many splitscreen wraps.
@@ -4271,6 +4273,8 @@
             ren = new T.WebGLRenderer({ antialias: true });
             _probe = new T.Vector3();
             ren.setClearColor(0x101820);
+            ren.domElement.style.pointerEvents = 'none';
+            ren.domElement.style.zIndex = '1';
             wrap.appendChild(ren.domElement);
 
             lyricsCanvas = document.createElement('canvas');
@@ -10627,13 +10631,19 @@
         }
 
         /* ── Resize helper ───────────────────────────────────────────────── */
+        function _syncWrapControlsInset() {
+            if (!wrap) return;
+            const ch = document.getElementById('player-controls')?.offsetHeight || 0;
+            wrap.style.bottom = ch > 0 ? ch + 'px' : '0';
+        }
+
         function applySize(w, h) {
             if (!ren || !cam || !wrap) return;
             if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+            _syncWrapControlsInset();
             const baseDPR = _ssActive() ? Math.min(devicePixelRatio, 1.25) : Math.min(devicePixelRatio, 2);
             ren.setPixelRatio(_renderScale * baseDPR);
             ren.setSize(w, h);
-            wrap.style.height = h + 'px';
             if (lyricsCanvas) { lyricsCanvas.width = w; lyricsCanvas.height = h; }
             _diagRenderCache.clear();
             cam.aspect = w / h;
@@ -10815,17 +10825,26 @@
         }
 
         function canvasSize(canvas) {
+            const controls = document.getElementById('player-controls');
+            const controlsHeight = controls ? controls.offsetHeight : 120;
             if (canvas) {
-                // If the canvas has zero bounds (hidden via any mechanism — inline style,
-                // CSS class, or hidden ancestor) fall back to the parent container
-                // (the splitscreen panelDiv) which is always visible and correctly sized.
                 const rect = canvas.getBoundingClientRect();
-                const target = (rect.width === 0 || rect.height === 0) && canvas.parentNode ? canvas.parentNode : canvas;
-                const sz = target === canvas ? rect : target.getBoundingClientRect();
-                if (sz.width > 0 && sz.height > 0) return { w: sz.width, h: sz.height };
+                if (rect.width > 0 && rect.height > 0) {
+                    return { w: rect.width, h: Math.max(100, rect.height) };
+                }
+                // Parent is often #player, which includes the controls bar — never
+                // size the overlay to that full height or WebGL steals pointer events.
+                if (canvas.parentNode) {
+                    const pr = canvas.parentNode.getBoundingClientRect();
+                    if (pr.width > 0 && pr.height > 0) {
+                        return {
+                            w: pr.width,
+                            h: Math.max(100, pr.height - controlsHeight),
+                        };
+                    }
+                }
             }
-            const ch = document.getElementById('player-controls')?.offsetHeight || 50;
-            return { w: innerWidth, h: innerHeight - ch };
+            return { w: innerWidth, h: Math.max(100, innerHeight - controlsHeight) };
         }
 
         /* ── setRenderer contract ────────────────────────────────────────── */

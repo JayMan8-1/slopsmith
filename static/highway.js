@@ -17,6 +17,9 @@ function createHighway() {
     // otherwise a per-frame poller floods playback:bridge-hit events and
     // diagnostics.
     let _audioElementBridgeRecorded = false;
+    // Generation that last reached `ready` on the active connection — used to
+    // ignore late error frames from a superseded or duplicate WebSocket.
+    let _wsReadyGen = 0;
     // Pending JUCE routing promise for the current connection's song_info.
     // The 'ready' handler awaits this so _juceMode is settled before
     // _onReady / song:ready fire, without blocking note/chord processing.
@@ -2558,6 +2561,7 @@ function createHighway() {
     // ── Public API ───────────────────────────────────────────────────────
     const api = {
         init(canvasEl, container) {
+            console.log('[arr] init called');
             canvas = canvasEl;
             _resizeContainer = container || null;
             // Size the canvas BEFORE installing the renderer so
@@ -2691,7 +2695,20 @@ function createHighway() {
         hasPhraseData() { return !!(_phrases && _phrases.length > 0); },
 
         connect(wsUrl, opts = {}) {
+            console.log('[arr] rebuilding transport', wsUrl);
             _connectOpts = opts;
+            // Close any live socket before opening a new one — otherwise a
+            // superseded connection can still deliver {error:...} after the
+            // replacement has already reached `ready`.
+            if (ws) {
+                const oldWs = ws;
+                ws = null;
+                oldWs.onmessage = null;
+                oldWs.onclose = null;
+                oldWs.onerror = null;
+                try { oldWs.close(); } catch (_) { /* already closed */ }
+            }
+            _wsReadyGen = 0;
             // Bump generation so async handlers from the previous connection
             // can detect they are stale and skip state mutations.
             _wsGen += 1;
@@ -2764,6 +2781,11 @@ function createHighway() {
                     try {
                     const msg = JSON.parse(data);
                     if (msg.error) {
+                        if (gen !== _wsGen) return;
+                        if (_wsReadyGen === gen) {
+                            console.warn('[arr] ignoring ws error after ready:', msg.error);
+                            return;
+                        }
                         console.error('Server error:', msg.error);
                         if (opts.onError) opts.onError(msg.error);
                         else alert('Error: ' + msg.error);
@@ -2938,6 +2960,11 @@ function createHighway() {
                                                         window._juceMode = true;
                                                         window._juceAudioUrl = audioUrl;
                                                         _reportAudioRoute('juce', 'available');
+                                                        // Re-apply speed slider (and label) onto the native resampler.
+                                                        const _spSlider = document.getElementById?.('speed-slider');
+                                                        if (_spSlider && typeof setSpeed === 'function') {
+                                                            void setSpeed(_spSlider.value / 100);
+                                                        }
                                                         // Re-apply the active Song fader whenever a new backing
                                                         // track is loaded so song-to-song switches keep the same
                                                         // user-selected level instead of the engine default.
@@ -3020,25 +3047,31 @@ function createHighway() {
                                     }
                                 }
                                 // Populate arrangement dropdown
-                                if (msg.arrangements) {
+                                console.log('[arr] loaded', msg.arrangements?.length);
+                                console.log('[arr] selected', msg.arrangement_index);
+                                if (Array.isArray(msg.arrangements) && msg.arrangements.length > 0) {
                                     const sel = document.getElementById('arr-select');
-                                    // Server-echoed naming_mode preferred; see HUD branch above.
-                                    let namingMode = msg.naming_mode;
-                                    if (namingMode !== 'smart' && namingMode !== 'legacy') {
-                                        try { namingMode = localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart'; } catch (_) { namingMode = 'smart'; }
+                                    if (sel) {
+                                        // Server-echoed naming_mode preferred; see HUD branch above.
+                                        let namingMode = msg.naming_mode;
+                                        if (namingMode !== 'smart' && namingMode !== 'legacy') {
+                                            try { namingMode = localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart'; } catch (_) { namingMode = 'smart'; }
+                                        }
+                                        sel.textContent = '';
+                                        for (const a of msg.arrangements) {
+                                            const displayName = (namingMode === 'smart' && a.smart_name) ? a.smart_name : a.name;
+                                            // Keep the note-count suffix in both modes — useful for
+                                            // disambiguating sibling arrangements (e.g. two "Alt. Lead"s).
+                                            const label = `${displayName} (${a.notes})`;
+                                            const opt = document.createElement('option');
+                                            opt.value = a.index;
+                                            opt.selected = a.index === msg.arrangement_index;
+                                            opt.textContent = label;
+                                            sel.appendChild(opt);
+                                        }
                                     }
-                                    sel.textContent = '';
-                                    for (const a of msg.arrangements) {
-                                        const displayName = (namingMode === 'smart' && a.smart_name) ? a.smart_name : a.name;
-                                        // Keep the note-count suffix in both modes — useful for
-                                        // disambiguating sibling arrangements (e.g. two "Alt. Lead"s).
-                                        const label = `${displayName} (${a.notes})`;
-                                        const opt = document.createElement('option');
-                                        opt.value = a.index;
-                                        opt.selected = a.index === msg.arrangement_index;
-                                        opt.textContent = label;
-                                        sel.appendChild(opt);
-                                    }
+                                } else if (Array.isArray(msg.arrangements) && msg.arrangements.length === 0) {
+                                    console.log('[arr] clearing arrangements');
                                 }
                             }
                             // Plugin context API — broadcast current song state
@@ -3127,6 +3160,7 @@ function createHighway() {
                             break;
                         case 'ready':
                             ready = true;
+                            if (gen === _wsGen) _wsReadyGen = gen;
                             if (handShapes.length) {
                                 handShapes.sort((a, b) => a.start_time - b.start_time);
                             }
@@ -3433,7 +3467,7 @@ function createHighway() {
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);
             const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decoded}${qs ? '?' + qs : ''}`;
-            console.log('reconnect:', wsUrl);
+            console.log('[arr] rebuilding transport (reconnect)', wsUrl);
             this.connect(wsUrl, _connectOpts);
         },
 

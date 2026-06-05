@@ -32,7 +32,175 @@ html { scroll-behavior: smooth; }
    the bottom controls bar would silently sit underneath the canvas
    and become click-through invisible.
    Folds in the fix from byrongamatos/slopsmith#99. */
-#player-controls { position: relative; z-index: 10; }
+.h3d-wrap,
+.h3d-wrap canvas {
+    pointer-events: none !important;
+}
+
+#player-controls {
+    position: relative;
+    z-index: 9999 !important;
+    pointer-events: auto !important;
+    flex-shrink: 0;
+}
+
+.speed-control {
+    pointer-events: auto !important;
+    position: relative;
+    z-index: 10000 !important;
+}
+
+.speed-control-label {
+    letter-spacing: 0.04em;
+}
+
+.speed-presets-primary .speed-preset-btn {
+    padding: 3px 7px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.speed-preset-btn {
+    padding: 2px 6px;
+    font-size: 10px;
+    line-height: 1.2;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgb(35, 35, 50);
+    color: #94a3b8;
+    cursor: pointer;
+    transition:
+        background 120ms ease,
+        border-color 120ms ease,
+        color 120ms ease,
+        box-shadow 120ms ease,
+        transform 120ms ease;
+}
+
+.speed-preset-btn:hover {
+    background: rgb(48, 48, 66);
+    color: #e2e8f0;
+    border-color: rgba(64, 128, 224, 0.45);
+    box-shadow: 0 0 6px rgba(64, 128, 224, 0.2);
+}
+
+.speed-preset-btn[data-sweet-spot="1"]:not(.speed-preset-active) {
+    border-color: rgba(232, 192, 64, 0.28);
+    color: #b8c5d6;
+}
+
+@keyframes speed-preset-glow {
+    0%, 100% {
+        box-shadow:
+            0 0 10px rgba(64, 128, 224, 0.4),
+            0 0 0 1px rgba(64, 128, 224, 0.35) inset;
+    }
+    50% {
+        box-shadow:
+            0 0 16px rgba(64, 128, 224, 0.55),
+            0 0 24px rgba(64, 128, 224, 0.18),
+            0 0 0 1px rgba(64, 128, 224, 0.45) inset;
+    }
+}
+
+.speed-preset-btn.speed-preset-active {
+    background: rgba(64, 128, 224, 0.36);
+    border-color: rgba(96, 160, 255, 0.9);
+    color: #f8fafc;
+    transform: translateY(-1px) scale(1.08);
+    animation: speed-preset-glow 2.4s ease-in-out infinite;
+}
+
+.speed-preset-btn[data-sweet-spot="1"].speed-preset-active {
+    border-color: rgba(232, 192, 64, 0.7);
+}
+
+.speed-fine-tune {
+    opacity: 0.92;
+}
+
+.speed-fine-label {
+    user-select: none;
+}
+
+.speed-slider-wrap {
+    position: relative;
+    width: 5rem;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.speed-slider-ticks {
+    position: absolute;
+    left: 6px;
+    right: 6px;
+    top: 50%;
+    height: 10px;
+    transform: translateY(-50%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+.speed-slider-sweetspot {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-radius: 4px;
+    background: linear-gradient(
+        90deg,
+        rgba(232, 192, 64, 0.06),
+        rgba(232, 192, 64, 0.14),
+        rgba(232, 192, 64, 0.06)
+    );
+    border: 1px solid rgba(232, 192, 64, 0.18);
+}
+
+.speed-slider-tick {
+    position: absolute;
+    top: 50%;
+    width: 2px;
+    height: 6px;
+    margin-left: -1px;
+    transform: translateY(-50%);
+    border-radius: 1px;
+    background: rgba(148, 163, 184, 0.45);
+}
+
+.speed-slider-tick.speed-slider-tick-sweet {
+    height: 8px;
+    background: rgba(232, 192, 64, 0.55);
+}
+
+#speed-slider,
+.speed-slider-input {
+    pointer-events: auto !important;
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    margin: 0;
+}
+
+.speed-quality-hint {
+    min-width: 6.5rem;
+    font-style: italic;
+    opacity: 1;
+    transition: opacity 180ms ease, color 180ms ease;
+}
+
+.speed-quality-hint.speed-quality-hint-fade {
+    opacity: 0.3;
+}
+
+/* Smooth fill on the practice speed slider only */
+.speed-slider-input::-webkit-slider-runnable-track {
+    transition: background 150ms ease;
+}
+
+.speed-slider-input::-moz-range-track {
+    transition: background 150ms ease;
+}
 
 .button-icon-svg {
     width: 14px;

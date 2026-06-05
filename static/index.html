@@ -495,8 +495,27 @@
             <button onclick="seekBy(5)" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition" title="Seek Forward 5s" aria-label="Seek Forward 5s">5s <img src="/static/svg/ff.svg" class="button-icon-svg" alt="" aria-hidden="true" /></button>
             <select id="arr-select" onchange="changeArrangement(this.value)" class="bg-dark-600 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-gray-300 outline-none max-w-[130px]"></select>
             <button id="arr-default-pin" type="button" onclick="pinCurrentArrangementDefault()" aria-pressed="false" aria-label="Select an arrangement to make it the default" class="w-8 h-8 inline-flex items-center justify-center bg-dark-600 border border-gray-700 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition" title="Select an arrangement to make it the default">☆</button>
-            <input type="range" id="speed-slider" min="25" max="150" value="100" step="5" oninput="setSpeed(this.value/100)" class="w-20 accent-accent slider-input">
-            <span id="speed-label" class="text-xs text-gray-500 w-10">1.0x</span>
+            <div id="speed-control" class="speed-control flex items-center gap-1.5 flex-wrap" data-playback-engine="soundtouch-realtime" title="Realtime preserve-pitch practice slowdown">
+                <span class="speed-control-label text-xs font-medium text-gray-400 shrink-0" title="Realtime preserve-pitch practice slowdown">Practice</span>
+                <div id="speed-presets" class="speed-presets speed-presets-primary flex items-center gap-0.5 flex-wrap" role="group" aria-label="Practice speed presets">
+                    <button type="button" class="speed-preset-btn" data-speed-preset="100" title="Full speed — 100%">100%</button>
+                    <button type="button" class="speed-preset-btn" data-speed-preset="90" title="90% — high quality practice">90%</button>
+                    <button type="button" class="speed-preset-btn" data-speed-preset="80" data-sweet-spot="1" title="80% — recommended practice range">80%</button>
+                    <button type="button" class="speed-preset-btn" data-speed-preset="75" data-sweet-spot="1" title="75% — recommended practice range">75%</button>
+                    <button type="button" class="speed-preset-btn" data-speed-preset="70" data-sweet-spot="1" title="70% — recommended practice range">70%</button>
+                    <button type="button" class="speed-preset-btn" data-speed-preset="60" title="60% — deep practice">60%</button>
+                    <button type="button" class="speed-preset-btn" data-speed-preset="50" title="50% — extreme slowdown">50%</button>
+                </div>
+                <div class="speed-fine-tune flex items-center gap-1 shrink-0" title="Fine-tune between presets">
+                    <span class="speed-fine-label text-[10px] text-gray-600 uppercase tracking-wide shrink-0">Fine</span>
+                    <div class="speed-slider-wrap">
+                        <div id="speed-slider-ticks" class="speed-slider-ticks" aria-hidden="true"></div>
+                        <input type="range" id="speed-slider" min="25" max="150" value="100" step="5" class="speed-slider-input slider-input accent-accent" aria-label="Fine playback speed adjustment">
+                    </div>
+                    <span id="speed-label" class="text-xs text-gray-500 w-10 tabular-nums shrink-0">1.0x</span>
+                    <span id="speed-quality-hint" class="text-xs text-gray-500 speed-quality-hint shrink-0" title="Expected timestretch quality at this speed">High Quality</span>
+                </div>
+            </div>
             <span id="mastery-slider-label" class="text-xs text-gray-500 ml-1">Difficulty</span>
             <input type="range" id="mastery-slider" min="0" max="100" value="100" step="5" oninput="setMastery(this.value)" class="w-20 accent-accent slider-input" title="Master difficulty — low = simpler chart, high = full" aria-labelledby="mastery-slider-label">
             <span id="mastery-label" class="text-xs text-gray-500 w-10">100%</span>
