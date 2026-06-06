@@ -16,16 +16,29 @@ const vm = require('node:vm');
 
 const APP_JS = path.join(__dirname, '..', '..', 'static', 'app.js');
 
-// Pull the source of `async function startCountIn() { ... }` by finding
-// the declaration and brace-matching to the closing brace. Brittle by
-// design: if the function gets renamed or restructured, the test fails
-// loudly with "function not found" rather than passing on stale code.
+// Pull the source of `async function startCountIn(opts = {}) { ... }` by
+// finding the declaration and brace-matching to the closing brace.
+// Brittle by design: if the function gets renamed or restructured, the
+// test fails loudly with "function not found" rather than passing on stale code.
+const START_COUNT_IN_SIG = 'async function startCountIn(';
 function extractFunction(src, signature) {
     const start = src.indexOf(signature);
     if (start === -1) throw new Error(`extractFunction: '${signature}' not found in app.js`);
-    const openBrace = src.indexOf('{', start);
+    let i = start + signature.length;
+    // Skip the formal parameter list, including default-value object literals
+    // like `opts = {}` — a naive indexOf('{') would grab the default, not the body.
+    // Signatures for this helper end with '(' (e.g. startCountIn().
+    let parenDepth = 1;
+    while (i < src.length && parenDepth > 0) {
+        const ch = src[i];
+        if (ch === '(') parenDepth++;
+        else if (ch === ')') parenDepth--;
+        i++;
+    }
+    const openBrace = src.indexOf('{', i);
+    if (openBrace === -1) throw new Error(`extractFunction: no body brace after '${signature}'`);
     let depth = 1;
-    let i = openBrace + 1;
+    i = openBrace + 1;
     while (i < src.length && depth > 0) {
         const ch = src[i];
         if (ch === '{') depth++;
@@ -74,6 +87,7 @@ function buildSandbox() {
         playClick: () => {},
         showCountOverlay: () => {},
         hideCountOverlay: () => {},
+        setPlayButtonState: () => {},
 
         // Stubbed DOM access. Anything querying for a button just gets a
         // permissive object that ignores writes.
@@ -104,7 +118,7 @@ function buildSandbox() {
 
 test('loop:restart fires once when wrap path runs', async () => {
     const src = fs.readFileSync(APP_JS, 'utf8');
-    const startCountInSrc = extractFunction(src, 'async function startCountIn()');
+    const startCountInSrc = extractFunction(src, START_COUNT_IN_SIG);
 
     // Sanity check: the change under test is present at all. Catches
     // accidental revert before we even run the behavior assertion.
@@ -156,7 +170,7 @@ test('loop:restart aborts when seek lands far from loopA (JUCE rollback)', async
     // wrap handler must abort instead of running beginCount on the wrong
     // position and emitting a misleading loop:restart.
     const src = fs.readFileSync(APP_JS, 'utf8');
-    const startCountInSrc = extractFunction(src, 'async function startCountIn()');
+    const startCountInSrc = extractFunction(src, START_COUNT_IN_SIG);
 
     const sandbox = buildSandbox();
     // Override _audioSeek to mimic JUCE rollback: completed but to=from,
@@ -192,7 +206,7 @@ test('count-in cancellation token bails delayed callbacks (rewindStep + tick)', 
     // of timer cancellation is out of scope for the static extractor; this
     // verifies the contract is wired into the source.
     const src = fs.readFileSync(APP_JS, 'utf8');
-    const fn = extractFunction(src, 'async function startCountIn()');
+    const fn = extractFunction(src, START_COUNT_IN_SIG);
     // Captures gen at entry
     assert.match(fn, /const gen = _countInGen/, 'startCountIn must capture _countInGen at entry');
     // Each delayed callback bails on mismatch
@@ -209,18 +223,19 @@ test('loop:restart fires after highway.setTime, before beginCount', () => {
     // moment chartTime jumps back, not after the count-in. The argument
     // to highway.setTime can be `loopA` or `r.to` (post-seek verified
     // position, when the caller has it) — both are valid.
+    //
+    // startCountIn now has two paths (immediate section-practice entry and
+    // the loop-wrap rewind). Assert on the wrap-path trio: the last
+    // loop:restart emit sits after the post-seek highway.setTime and before
+    // the matching beginCount() call.
     const src = fs.readFileSync(APP_JS, 'utf8');
-    const fn = extractFunction(src, 'async function startCountIn()');
-    // Grab the LAST highway.setTime in startCountIn — the rewindStep
-    // animation also calls setTime each frame, but the one we care about
-    // is the post-seek call right before the loop:restart emit.
+    const fn = extractFunction(src, START_COUNT_IN_SIG);
     const setTimeMatches = [...fn.matchAll(/highway\.setTime\(\s*[^)]+\)/g)];
     const setTimeIdx = setTimeMatches.length ? setTimeMatches[setTimeMatches.length - 1].index : -1;
-    const emitIdx = fn.search(/window\.slopsmith\.emit\(\s*['"]loop:restart['"]/);
-    // Match the *call* `beginCount(...)`, not the inner `function beginCount()`
-    // declaration that's hoisted alongside it inside startCountIn.
-    const beginCallMatch = fn.match(/(?<!function\s)\bbeginCount\s*\(/);
-    const beginCallIdx = beginCallMatch ? beginCallMatch.index : -1;
+    const emitMatches = [...fn.matchAll(/window\.slopsmith\.emit\(\s*['"]loop:restart['"]/g)];
+    const emitIdx = emitMatches.length ? emitMatches[emitMatches.length - 1].index : -1;
+    const beginCallMatches = [...fn.matchAll(/(?<!function\s)\bbeginCount\s*\(/g)];
+    const beginCallIdx = beginCallMatches.length ? beginCallMatches[beginCallMatches.length - 1].index : -1;
     assert.ok(setTimeIdx !== -1, 'highway.setTime call not found');
     assert.ok(emitIdx !== -1, 'loop:restart emit not found');
     assert.ok(beginCallIdx !== -1, 'beginCount() call not found');

@@ -83,9 +83,19 @@ function buildSandbox() {
 function loadFunctions(sandbox, src) {
     // Pull just the loop helpers — clearLoop, setLoop, updateLoopUI
     // (called by setLoop), and the loop state vars.
+    // Section Practice hooks are stubbed so loop API tests stay isolated
+    // from the full section-practice module (updateLoopUI/clearLoop call
+    // into it after Phase 2/3 integration).
     const code = `
         var loopA = null;
         var loopB = null;
+        var _sectionPracticeSelected = -1;
+        var _sectionPracticeWholeSection = false;
+        var _sectionPracticeSavedPartIndex = 0;
+        var _sectionPracticeMode = false;
+        function _syncSectionPracticeFromLoop() {}
+        function _setSectionPracticeMode(on, opts) { _sectionPracticeMode = !!on; }
+        function _updateSectionPracticeHighlight(ct) {}
         ${extractFunction(src, 'function clearLoop(')}
         ${extractFunction(src, 'function _syncSavedLoopSelection()')}
         ${extractFunction(src, 'async function setLoop(')}
