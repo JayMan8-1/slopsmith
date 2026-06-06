@@ -426,6 +426,23 @@ function _isInsideInteractiveControl(el) {
     return false;
 }
 
+function _isSpaceKey(e) {
+    return e.key === ' ' || e.key === 'Spacebar';
+}
+
+function _sectionPracticeBarContains(el) {
+    if (!el) return false;
+    const bar = document.getElementById('section-practice-bar');
+    return !!(bar && bar.contains(el));
+}
+
+function _shortcutDispatchBlocked(e) {
+    if (_isTextInput(e.target)) return true;
+    // Space in Section Practice bar should pause/resume, not toggle checkboxes/buttons.
+    if (_isSpaceKey(e) && _sectionPracticeBarContains(e.target)) return false;
+    return _isInsideInteractiveControl(e.target);
+}
+
 function _handleLibArrowNav(e) {
     // Space (' ') is the standard activation key for focusable
     // elements alongside Enter — without it, a screen-reader user
@@ -5114,7 +5131,7 @@ function _useJuceBacking() {
 const SPEED_PRESET_PCTS = [100, 90, 80, 75, 70, 60, 50];
 const SPEED_SWEET_SPOT_PCTS = [80, 75, 70];
 const SPEED_SNAP_THRESHOLD = 0.02;
-const SPEED_SLIDER_MIN = 25;
+const SPEED_SLIDER_MIN = 15;
 const SPEED_SLIDER_MAX = 150;
 
 function _speedSliderPosPct(pct) {
@@ -5181,7 +5198,7 @@ function _updateSpeedPresetButtons(activePct) {
 function applySpeedPreset(percent) {
     const slider = document.getElementById('speed-slider');
     if (!slider) return;
-    const pct = Math.max(Number(slider.min) || 25, Math.min(Number(slider.max) || 150, Number(percent)));
+    const pct = Math.max(Number(slider.min) || SPEED_SLIDER_MIN, Math.min(Number(slider.max) || 150, Number(percent)));
     slider.value = String(pct);
     handleSliderInput(slider);
     _updateSpeedPresetButtons(pct);
@@ -5922,6 +5939,8 @@ function clearLoop(options) {
     document.getElementById('loop-label').textContent = '';
     document.getElementById('saved-loops').value = '';
     _sectionPracticeSelected = -1;
+    _sectionPracticeWholeSection = false;
+    _sectionPracticeSavedPartIndex = 0;
     _updateSectionPracticeHighlight(_audioTime());
     if (hadLoop && emitTransportEvent && typeof window !== 'undefined') {
         window.slopsmith?.playback?.transportEvent?.('loop-cleared', {
@@ -6016,12 +6035,17 @@ function updateLoopUI() {
 // Reuses setLoop() so manual A/B controls and saved loops stay canonical.
 let _sectionPracticeRanges = [];
 let _sectionPracticeSelected = -1;
-let _sectionPracticePlaying = -1;
+let _sectionPracticeFollowParent = -1;
 let _sectionPracticeDurSynced = false;
 let _sectionPracticeLogged = false;
 let _sectionPracticeHooked = false;
 let _sectionPracticeRetryTimer = null;
+let _sectionPracticeLastPlayableCount = 0;
+let _sectionPracticePlayablePopulateRerendered = false;
 let _sectionPracticeMode = false;
+let _sectionPracticeActiveParent = -1;
+let _sectionPracticeWholeSection = false;
+let _sectionPracticeSavedPartIndex = 0;
 
 function _setSectionPracticeMode(on, opts = {}) {
     const next = !!on;
@@ -6031,11 +6055,21 @@ function _setSectionPracticeMode(on, opts = {}) {
     if (cb) cb.checked = _sectionPracticeMode;
     const bar = document.getElementById('section-practice-bar');
     if (bar) bar.classList.toggle('section-practice-bar--mode-on', _sectionPracticeMode);
+    _sectionPracticeFollowParent = -1;
     if (_sectionPracticeMode) {
+        if (opts.defaultWholeOn) {
+            _sectionPracticeWholeSection = true;
+        }
         console.log('[section-practice] mode on');
+        _updateSectionPracticeHighlight(_audioTime());
+        if (opts.defaultWholeOn) {
+            _syncSectionPracticePieceUi();
+        }
     } else {
         console.log('[section-practice] mode off');
         _sectionPracticeSelected = -1;
+        _sectionPracticeWholeSection = false;
+        _sectionPracticeSavedPartIndex = 0;
         _updateSectionPracticeHighlight(_audioTime());
         if (!opts.skipClearLoop && (loopA !== null || loopB !== null)) {
             clearLoop();
@@ -6046,11 +6080,14 @@ function _setSectionPracticeMode(on, opts = {}) {
 function onSectionPracticeModeChange() {
     const cb = document.getElementById('section-practice-mode');
     if (!cb) return;
-    _setSectionPracticeMode(cb.checked);
+    const turningOn = cb.checked && !_sectionPracticeMode;
+    _setSectionPracticeMode(cb.checked, { defaultWholeOn: turningOn });
 }
 
 function _resetSectionPracticeLog() {
     _sectionPracticeLogged = false;
+    _sectionPracticeLastPlayableCount = 0;
+    _sectionPracticePlayablePopulateRerendered = false;
 }
 
 function _sectionPracticeHighway() {
@@ -6098,7 +6135,65 @@ function _sectionPracticeBaseName(rawName, fallbackIndex) {
     return lower.split(/\s+/).filter(Boolean).map(w => w[0].toUpperCase() + w.slice(1)).join(' ') || `Section ${fallbackIndex + 1}`;
 }
 
-function _buildSectionPracticeRanges() {
+const _SECTION_PRACTICE_START_GAP_SEC = 0.05;
+
+function _sectionPracticeNoteTime(note) {
+    const t = note?.t ?? note?.time ?? note?.start_time ?? note?.start;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : NaN;
+}
+
+function _sectionPracticePlayableCount() {
+    const hw = _sectionPracticeHighway();
+    if (!hw) return 0;
+    let count = 0;
+    if (typeof hw.getNotes === 'function') {
+        const notes = hw.getNotes();
+        if (notes?.length) count += notes.length;
+    }
+    if (typeof hw.getChords === 'function') {
+        const chords = hw.getChords();
+        if (chords?.length) count += chords.length;
+    }
+    return count;
+}
+
+function _sectionPracticeHasNotesBefore(beforeTime) {
+    const hw = _sectionPracticeHighway();
+    if (!hw) return false;
+    const cutoff = Number(beforeTime);
+    if (!Number.isFinite(cutoff)) return false;
+    const sources = [];
+    if (typeof hw.getNotes === 'function') {
+        const notes = hw.getNotes();
+        if (notes?.length) sources.push(notes);
+    }
+    if (typeof hw.getChords === 'function') {
+        const chords = hw.getChords();
+        if (chords?.length) sources.push(chords);
+    }
+    for (let s = 0; s < sources.length; s++) {
+        const items = sources[s];
+        for (let i = 0; i < items.length; i++) {
+            const t = _sectionPracticeNoteTime(items[i]);
+            if (Number.isFinite(t) && t < cutoff) return true;
+        }
+    }
+    return false;
+}
+
+function _maybeRerenderSectionPracticeOnPlayableLoad() {
+    const count = _sectionPracticePlayableCount();
+    const prev = _sectionPracticeLastPlayableCount;
+    _sectionPracticeLastPlayableCount = count;
+    if (_sectionPracticePlayablePopulateRerendered) return;
+    if (prev !== 0 || count === 0) return;
+    if (!_sectionPracticeSourceSections().length || !_sectionPracticeBarIsReady()) return;
+    _sectionPracticePlayablePopulateRerendered = true;
+    renderSectionPracticeBar();
+}
+
+function _buildSectionParents() {
     const raw = _sectionPracticeSourceSections();
     if (!raw.length) return [];
     const dur = _sectionPracticeDuration();
@@ -6141,30 +6236,239 @@ function _buildSectionPracticeRanges() {
         }
         ranges.push({ name: label, start, end });
     }
+    if (ranges.length > 0) {
+        const firstStart = Number(ranges[0].start);
+        if (Number.isFinite(firstStart) && firstStart > _SECTION_PRACTICE_START_GAP_SEC
+            && _sectionPracticeHasNotesBefore(firstStart)) {
+            ranges.unshift({ name: 'Start', start: 0, end: firstStart });
+        }
+    }
     return ranges;
+}
+
+function _sectionPracticeResetSelectionUi() {
+    _sectionPracticeActiveParent = -1;
+    _sectionPracticeSelected = -1;
+    _sectionPracticeWholeSection = false;
+    _sectionPracticeSavedPartIndex = 0;
+    _sectionPracticeRanges = [];
+}
+
+function _sectionPracticeSourcePhrases() {
+    const hw = _sectionPracticeHighway();
+    if (!hw || typeof hw.getPracticePhrases !== 'function') return null;
+    const raw = hw.getPracticePhrases();
+    return (raw && raw.length) ? raw : null;
+}
+
+function _buildPhrasePartsForParent(parent) {
+    if (!parent) return [];
+    const dur = _sectionPracticeDuration();
+    const windowStart = parent.start;
+    const windowEnd = parent.end;
+    const phrases = _sectionPracticeSourcePhrases();
+    const parts = [];
+
+    if (phrases) {
+        const inWindow = phrases.filter(
+            (ph) => ph.start_time >= windowStart - 0.001 && ph.start_time < windowEnd - 0.001,
+        );
+        if (inWindow.length) {
+            for (let i = 0; i < inWindow.length; i++) {
+                const ph = inWindow[i];
+                let start = ph.start_time;
+                let end = ph.end_time;
+                if (!Number.isFinite(end) || end > windowEnd) end = windowEnd;
+                if (!Number.isFinite(start) || end <= start) continue;
+                if (dur && Number.isFinite(dur) && end > dur) end = dur;
+                parts.push({ name: parent.name, start, end });
+            }
+            // Snap first part to section start so the loop aligns with the selected marker
+            // when the first in-window phrase iteration begins later (e.g. Chorus 2).
+            if (parts.length > 0 && parts[0].start > windowStart) {
+                parts[0].start = windowStart;
+            }
+            return parts;
+        }
+    }
+
+    let start = windowStart;
+    let end = windowEnd;
+    if (dur && Number.isFinite(dur) && end > dur) end = dur;
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        parts.push({ name: parent.name, start, end });
+    }
+    return parts;
+}
+
+function _buildSectionPracticeRanges() {
+    if (_sectionPracticeActiveParent < 0) return [];
+    const parents = _buildSectionParents();
+    const parent = parents[_sectionPracticeActiveParent];
+    if (!parent) return [];
+    return _buildPhrasePartsForParent(parent);
+}
+
+function _sectionPracticeActiveParentRange() {
+    if (_sectionPracticeActiveParent < 0) return null;
+    const parents = _buildSectionParents();
+    const parent = parents[_sectionPracticeActiveParent];
+    if (!parent) return null;
+    const dur = _sectionPracticeDuration();
+    let end = Number(parent.end);
+    const start = Number(parent.start);
+    if (dur && Number.isFinite(dur) && end > dur) end = dur;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    return { name: parent.name, start, end };
+}
+
+function _sectionPracticeResolveLoopTarget(index, opts = {}) {
+    if (opts.whole) {
+        return _sectionPracticeActiveParentRange();
+    }
+    return _sectionPracticeRanges[index] ?? null;
 }
 
 function _formatSectionPracticeName(name) {
     return name.replace(/_/g, ' ');
 }
 
+const _SECTION_PRACTICE_CHIP_KINDS = new Set([
+    'intro', 'verse', 'chorus', 'bridge', 'solo', 'riff', 'outro',
+]);
+
+function _sectionPracticeChipKindClass(name, index) {
+    const base = _sectionPracticeBaseName(name, index);
+    const kind = base.toLowerCase();
+    if (!_SECTION_PRACTICE_CHIP_KINDS.has(kind)) return '';
+    return ` section-practice-chip--${kind}`;
+}
+
+function _sectionPracticeWholeCheckboxHtml() {
+    return '<label class="section-practice-whole-wrap" title="Loop the whole selected section">'
+        + '<input type="checkbox" id="section-practice-whole" onchange="onSectionPracticeWholeChange()">'
+        + '<span class="section-practice-whole-text">Full section</span>'
+        + '</label>';
+}
+
+function _sectionPracticePieceRowHtml() {
+    return '<div id="section-practice-piece-row" class="section-practice-row section-practice-piece-row">'
+        + '<span id="section-practice-piece-label" class="section-practice-piece-label" aria-live="polite">Part — of —</span>'
+        + '<button type="button" id="section-practice-piece-prev" class="section-practice-chip" onclick="onPhrasePrev()">◀ Previous</button>'
+        + '<button type="button" id="section-practice-piece-next" class="section-practice-chip" onclick="onPhraseNext()">Next ▶</button>'
+        + '</div>';
+}
+
+function _sectionPracticeMainRow() {
+    const bar = document.getElementById('section-practice-bar');
+    if (!bar) return null;
+    return bar.querySelector('.section-practice-controls-row')
+        || bar.querySelector('.section-practice-primary-row')
+        || bar.querySelector('.section-practice-row:not(.section-practice-piece-row):not(.section-practice-chips-row)');
+}
+
+function _migrateSectionPracticeDomLayout(bar) {
+    if (!bar || bar.querySelector('.section-practice-controls-row')) return;
+
+    const pieceRow = document.getElementById('section-practice-piece-row');
+    const scroll = document.getElementById('section-practice-scroll');
+    const modeWrap = bar.querySelector('.section-practice-mode-wrap');
+    const wholeWrap = bar.querySelector('.section-practice-whole-wrap');
+    let label = bar.querySelector('.section-practice-label');
+
+    const controlsRow = document.createElement('div');
+    controlsRow.className = 'section-practice-row section-practice-controls-row';
+    if (modeWrap) controlsRow.appendChild(modeWrap);
+    if (wholeWrap) controlsRow.appendChild(wholeWrap);
+    if (pieceRow) controlsRow.appendChild(pieceRow);
+
+    const chipsRow = document.createElement('div');
+    chipsRow.className = 'section-practice-row section-practice-chips-row';
+    if (label) {
+        chipsRow.appendChild(label);
+    } else {
+        label = document.createElement('span');
+        label.className = 'section-practice-label';
+        label.textContent = 'Sections:';
+        chipsRow.appendChild(label);
+    }
+    if (scroll) chipsRow.appendChild(scroll);
+
+    bar.replaceChildren(controlsRow, chipsRow);
+}
+
+function _sectionPracticeBarInnerHtml() {
+    return '<div class="section-practice-row section-practice-controls-row">'
+        + '<label class="section-practice-mode-wrap" title="Loop the selected section until turned off">'
+        + '<input type="checkbox" id="section-practice-mode" onchange="onSectionPracticeModeChange()">'
+        + '<span class="section-practice-mode-text">Practice Section</span>'
+        + '</label>'
+        + _sectionPracticeWholeCheckboxHtml()
+        + _sectionPracticePieceRowHtml()
+        + '</div>'
+        + '<div class="section-practice-row section-practice-chips-row">'
+        + '<span class="section-practice-label">Sections:</span>'
+        + '<div id="section-practice-scroll" class="section-practice-scroll" role="toolbar"></div>'
+        + '</div>';
+}
+
+function _ensureSectionPracticeWholeCheckbox() {
+    const existing = document.getElementById('section-practice-whole');
+    const mainRow = _sectionPracticeMainRow();
+    if (!mainRow) return;
+    if (existing) {
+        const wrap = existing.closest('.section-practice-whole-wrap');
+        if (wrap && !mainRow.contains(wrap)) {
+            const modeWrap = mainRow.querySelector('.section-practice-mode-wrap');
+            if (modeWrap) modeWrap.insertAdjacentElement('afterend', wrap);
+            else mainRow.insertBefore(wrap, mainRow.firstChild);
+        }
+        return;
+    }
+    const modeWrap = mainRow.querySelector('.section-practice-mode-wrap');
+    if (modeWrap) {
+        modeWrap.insertAdjacentHTML('afterend', _sectionPracticeWholeCheckboxHtml());
+    } else {
+        mainRow.insertAdjacentHTML('afterbegin', _sectionPracticeWholeCheckboxHtml());
+    }
+}
+
+function _sectionPracticeCurrentPartIndex() {
+    const total = _sectionPracticeRanges.length;
+    if (!total) return 0;
+    if (!_sectionPracticeWholeSection && _sectionPracticeSelected >= 0) {
+        return Math.min(_sectionPracticeSelected, total - 1);
+    }
+    if (_sectionPracticeSavedPartIndex >= 0) {
+        return Math.min(_sectionPracticeSavedPartIndex, total - 1);
+    }
+    return 0;
+}
+
 function _ensureSectionPracticeDom() {
     let bar = document.getElementById('section-practice-bar');
-    if (bar) return bar;
+    if (bar) {
+        _migrateSectionPracticeDomLayout(bar);
+        if (!bar.querySelector('#section-practice-piece-row')) {
+            const controlsRow = bar.querySelector('.section-practice-controls-row')
+                || bar.querySelector('.section-practice-primary-row');
+            if (controlsRow) {
+                controlsRow.insertAdjacentHTML('beforeend', _sectionPracticePieceRowHtml());
+            } else {
+                bar.insertAdjacentHTML('beforeend', _sectionPracticePieceRowHtml());
+            }
+        }
+        _ensureSectionPracticeWholeCheckbox();
+        bar.querySelector('.section-practice-show-all-wrap')?.remove();
+        return bar;
+    }
     const controls = document.getElementById('player-controls');
     if (!controls) return null;
     bar = document.createElement('div');
     bar.id = 'section-practice-bar';
     bar.className = 'section-practice-bar section-practice-bar--hidden';
     bar.setAttribute('aria-label', 'Section practice');
-    bar.innerHTML = '<div class="section-practice-row">'
-        + '<label class="section-practice-mode-wrap" title="Loop the selected section until turned off">'
-        + '<input type="checkbox" id="section-practice-mode" onchange="onSectionPracticeModeChange()">'
-        + '<span class="section-practice-mode-text">Practice Section</span>'
-        + '</label>'
-        + '<span class="section-practice-label">Sections:</span>'
-        + '<div id="section-practice-scroll" class="section-practice-scroll" role="toolbar"></div>'
-        + '</div>';
+    bar.innerHTML = _sectionPracticeBarInnerHtml();
     controls.insertBefore(bar, controls.firstChild);
     return bar;
 }
@@ -6182,11 +6486,22 @@ function _hideSectionPracticeBar() {
         bar.style.display = 'none';
     }
     _sectionPracticeRanges = [];
+    _sectionPracticeActiveParent = -1;
     _sectionPracticeSelected = -1;
-    _sectionPracticePlaying = -1;
+    _sectionPracticeWholeSection = false;
+    _sectionPracticeSavedPartIndex = 0;
+    _sectionPracticeFollowParent = -1;
     _sectionPracticeDurSynced = false;
     const scroll = document.getElementById('section-practice-scroll');
     if (scroll) scroll.innerHTML = '';
+    _syncSectionPracticePieceUi();
+}
+
+function _sectionPracticeBarIsReady() {
+    const bar = document.getElementById('section-practice-bar');
+    if (!bar || bar.classList.contains('section-practice-bar--hidden')) return false;
+    const scroll = document.getElementById('section-practice-scroll');
+    return !!(scroll && scroll.querySelector('[data-parent-idx]'));
 }
 
 function _installSectionPracticeDrawHook() {
@@ -6195,10 +6510,10 @@ function _installSectionPracticeDrawHook() {
     if (!hw || typeof hw.addDrawHook !== 'function') return;
     _sectionPracticeHooked = true;
     hw.addDrawHook(() => {
-        if (_sectionPracticeRanges.length > 0) return;
-        if (_sectionPracticeSourceSections().length > 0) {
-            renderSectionPracticeBar();
-        }
+        if (_sectionPracticeSourceSections().length === 0) return;
+        _maybeRerenderSectionPracticeOnPlayableLoad();
+        if (_sectionPracticeBarIsReady()) return;
+        renderSectionPracticeBar();
     });
 }
 
@@ -6209,13 +6524,42 @@ function _scheduleSectionPracticeRetries() {
     const tick = () => {
         renderSectionPracticeBar();
         i += 1;
-        if (i < delays.length && _sectionPracticeRanges.length === 0) {
+        if (i < delays.length && !_sectionPracticeBarIsReady()) {
             _sectionPracticeRetryTimer = setTimeout(tick, delays[i]);
         } else {
             _sectionPracticeRetryTimer = null;
         }
     };
     tick();
+}
+
+function _syncSectionPracticePieceUi() {
+    const label = document.getElementById('section-practice-piece-label');
+    const prev = document.getElementById('section-practice-piece-prev');
+    const next = document.getElementById('section-practice-piece-next');
+    const wholeCb = document.getElementById('section-practice-whole');
+    const total = _sectionPracticeRanges.length;
+    const active = _sectionPracticeActiveParent >= 0;
+    if (label) {
+        if (!active || !total) {
+            label.textContent = 'Part — of —';
+        } else {
+            const idx = _sectionPracticeCurrentPartIndex();
+            label.textContent = `Part ${idx + 1} of ${total}`;
+        }
+    }
+    if (wholeCb) {
+        wholeCb.checked = _sectionPracticeWholeSection;
+    }
+    const partIdx = (!active || !total || _sectionPracticeWholeSection)
+        ? 0
+        : (_sectionPracticeSelected >= 0 ? _sectionPracticeSelected : 0);
+    if (prev) {
+        prev.disabled = !active || !total || (!_sectionPracticeWholeSection && partIdx <= 0);
+    }
+    if (next) {
+        next.disabled = !active || !total || (!_sectionPracticeWholeSection && partIdx >= total - 1);
+    }
 }
 
 function renderSectionPracticeBar() {
@@ -6225,37 +6569,130 @@ function renderSectionPracticeBar() {
         console.log(`[section-practice] sections found: ${raw.length}`);
         _sectionPracticeLogged = true;
     }
-    _sectionPracticeRanges = _buildSectionPracticeRanges();
+    const parents = _buildSectionParents();
     const bar = _ensureSectionPracticeDom();
     const scroll = document.getElementById('section-practice-scroll');
     if (!bar || !scroll) return;
-    if (_sectionPracticeRanges.length === 0) {
+    if (!parents.length) {
         _hideSectionPracticeBar();
         return;
     }
+    if (_sectionPracticeActiveParent >= parents.length) {
+        _sectionPracticeResetSelectionUi();
+    }
     _showSectionPracticeBar(bar);
-    scroll.innerHTML = _sectionPracticeRanges.map((r, i) => {
-        const label = _formatSectionPracticeName(r.name);
-        const tip = `${label} (${formatTime(r.start)}–${formatTime(r.end)})`;
-        return `<button type="button" class="section-practice-chip" data-section-idx="${i}" title="${esc(tip)}" onclick="practiceSection(${i})">${esc(label)}</button>`;
+    scroll.innerHTML = parents.map((p, i) => {
+        const label = _formatSectionPracticeName(p.name);
+        const tip = `${label} (${formatTime(p.start)}–${formatTime(p.end)})`;
+        const kindClass = _sectionPracticeChipKindClass(p.name, i);
+        return `<button type="button" class="section-practice-chip${kindClass}" data-parent-idx="${i}" title="${esc(tip)}" onclick="onSectionParentClick(${i})">${esc(label)}</button>`;
     }).join('');
-    _syncSectionPracticeFromLoop();
+    _sectionPracticeRanges = _buildSectionPracticeRanges();
+    _syncSectionPracticePieceUi();
+    if (_sectionPracticeRanges.length) {
+        _syncSectionPracticeFromLoop();
+    }
     _updateSectionPracticeHighlight(_audioTime());
 }
 
-function _sectionPracticeLoopIndex() {
-    if (loopA === null || loopB === null) return -1;
+async function onSectionParentClick(parentIdx) {
+    const parents = _buildSectionParents();
+    const idx = Number(parentIdx);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= parents.length) return;
+    _sectionPracticeActiveParent = idx;
+    _sectionPracticeRanges = _buildSectionPracticeRanges();
+    _sectionPracticeSelected = -1;
+    _sectionPracticeSavedPartIndex = 0;
+    _sectionPracticeWholeSection = true;
+    _syncSectionPracticePieceUi();
+    _updateSectionPracticeHighlight(_audioTime());
+    if (_sectionPracticeActiveParentRange() || _sectionPracticeRanges.length) {
+        await practiceSection(0, { whole: true });
+    }
+}
+
+async function onSectionPracticeWholeChange() {
+    const cb = document.getElementById('section-practice-whole');
+    if (!cb || _sectionPracticeActiveParent < 0) return;
+    const total = _sectionPracticeRanges.length;
+    if (!total) return;
+    if (cb.checked === _sectionPracticeWholeSection) return;
+    _sectionPracticeWholeSection = cb.checked;
+    if (cb.checked) {
+        await practiceSection(_sectionPracticeCurrentPartIndex(), { whole: true });
+        return;
+    }
+    await practiceSection(0);
+}
+
+async function onPhrasePrev() {
+    const total = _sectionPracticeRanges.length;
+    if (!total || _sectionPracticeActiveParent < 0) return;
+    if (_sectionPracticeWholeSection) {
+        _sectionPracticeWholeSection = false;
+        _syncSectionPracticePieceUi();
+        await practiceSection(0);
+        return;
+    }
+    const cur = _sectionPracticeSelected >= 0 ? _sectionPracticeSelected : 0;
+    if (cur <= 0) return;
+    await practiceSection(cur - 1);
+}
+
+async function onPhraseNext() {
+    const total = _sectionPracticeRanges.length;
+    if (!total || _sectionPracticeActiveParent < 0) return;
+    if (_sectionPracticeWholeSection) {
+        _sectionPracticeWholeSection = false;
+        _syncSectionPracticePieceUi();
+        await practiceSection(0);
+        return;
+    }
+    const cur = _sectionPracticeSelected >= 0 ? _sectionPracticeSelected : 0;
+    if (cur >= total - 1) return;
+    await practiceSection(cur + 1);
+}
+
+window.onSectionParentClick = onSectionParentClick;
+window.onSectionPracticeWholeChange = onSectionPracticeWholeChange;
+window.onPhrasePrev = onPhrasePrev;
+window.onPhraseNext = onPhraseNext;
+
+function _sectionPracticeLoopMatch() {
+    if (loopA === null || loopB === null) return null;
+    let partMatch = -1;
     for (let i = 0; i < _sectionPracticeRanges.length; i++) {
         const r = _sectionPracticeRanges[i];
         if (Math.abs(r.start - loopA) < 0.05 && Math.abs(r.end - loopB) < 0.05) {
-            return i;
+            partMatch = i;
+            break;
         }
     }
-    return -1;
+    const parent = _sectionPracticeActiveParentRange();
+    const wholeMatch = !!(parent
+        && _sectionPracticeActiveParent >= 0
+        && Math.abs(parent.start - loopA) < 0.05
+        && Math.abs(parent.end - loopB) < 0.05);
+    if (wholeMatch && partMatch >= 0) {
+        if (_sectionPracticeWholeSection) return { whole: true };
+        return { whole: false, index: partMatch };
+    }
+    if (wholeMatch) return { whole: true };
+    if (partMatch >= 0) return { whole: false, index: partMatch };
+    return null;
 }
 
-async function practiceSection(index) {
-    const r = _sectionPracticeRanges[index];
+function _blurSectionPracticeFocusIfNeeded() {
+    const ae = document.activeElement;
+    const bar = document.getElementById('section-practice-bar');
+    if (ae && bar && bar.contains(ae) && typeof ae.blur === 'function') {
+        ae.blur();
+    }
+}
+
+async function practiceSection(index, opts = {}) {
+    const whole = !!opts.whole;
+    const r = _sectionPracticeResolveLoopTarget(index, opts);
     if (!r) return;
     const dur = _sectionPracticeDuration();
     const start = Number(r.start);
@@ -6284,7 +6721,12 @@ async function practiceSection(index) {
     }
 
     if (ok) {
-        _sectionPracticeSelected = index;
+        _sectionPracticeWholeSection = whole;
+        if (!whole) {
+            _sectionPracticeSelected = index;
+            _sectionPracticeSavedPartIndex = index;
+        }
+        _blurSectionPracticeFocusIfNeeded();
         _updateSectionPracticeHighlight(_audioTime());
         console.log('[section-practice] loop set', {
             loopA,
@@ -6301,10 +6743,19 @@ async function practiceSection(index) {
 
 function _syncSectionPracticeFromLoop() {
     if (!_sectionPracticeRanges.length) return;
-    const match = _sectionPracticeLoopIndex();
-    _sectionPracticeSelected = match;
+    const match = _sectionPracticeLoopMatch();
+    if (match) {
+        _sectionPracticeWholeSection = match.whole;
+        if (!match.whole) {
+            _sectionPracticeSelected = match.index;
+            _sectionPracticeSavedPartIndex = match.index;
+        }
+    } else {
+        _sectionPracticeWholeSection = false;
+        _sectionPracticeSelected = -1;
+    }
     if (loopA !== null && loopB !== null) {
-        if (match >= 0) {
+        if (match) {
             if (!_sectionPracticeMode) {
                 _setSectionPracticeMode(true, { skipClearLoop: true });
             }
@@ -6325,22 +6776,44 @@ function _sectionPracticeIndexAtTime(t) {
     return -1;
 }
 
+function _sectionPracticeParentIndexAtTime(t) {
+    const parents = _buildSectionParents();
+    if (!Number.isFinite(t) || parents.length === 0) return -1;
+    for (let i = parents.length - 1; i >= 0; i--) {
+        if (t >= parents[i].start) return i;
+    }
+    return -1;
+}
+
+function _scrollSectionPracticeChipIntoView(chip) {
+    if (!chip) return;
+    chip.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
 function _updateSectionPracticeHighlight(ct) {
     const scroll = document.getElementById('section-practice-scroll');
-    if (!scroll || _sectionPracticeRanges.length === 0) return;
-    const playing = _sectionPracticeIndexAtTime(ct);
-    const chips = scroll.querySelectorAll('.section-practice-chip');
-    chips.forEach((chip, i) => {
-        chip.classList.toggle('is-playing', i === playing);
-        chip.classList.toggle('is-selected', i === _sectionPracticeSelected);
+    if (!scroll) return;
+    const chips = scroll.querySelectorAll('.section-practice-chip[data-parent-idx]');
+    if (!chips.length) return;
+
+    const followEnabled = !_sectionPracticeMode && _sectionPracticeBarIsReady();
+    const followParent = followEnabled ? _sectionPracticeParentIndexAtTime(ct) : -1;
+
+    chips.forEach((chip) => {
+        const idx = Number(chip.dataset.parentIdx);
+        chip.classList.toggle('is-selected', idx === _sectionPracticeActiveParent);
+        chip.classList.toggle('is-playing', followEnabled && idx === followParent);
     });
-    if (playing !== _sectionPracticePlaying) {
-        _sectionPracticePlaying = playing;
-        if (playing >= 0) {
-            const active = scroll.querySelector(`[data-section-idx="${playing}"]`);
-            active?.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
-        }
+
+    if (followEnabled && followParent >= 0 && followParent !== _sectionPracticeFollowParent) {
+        _sectionPracticeFollowParent = followParent;
+        const chip = scroll.querySelector(`.section-practice-chip[data-parent-idx="${followParent}"]`);
+        _scrollSectionPracticeChipIntoView(chip);
+    } else if (!followEnabled) {
+        _sectionPracticeFollowParent = -1;
     }
+
+    _syncSectionPracticePieceUi();
 }
 
 function _maybeRefreshSectionPracticeDuration(dur) {
@@ -6360,8 +6833,7 @@ function _maybeRefreshSectionPracticeDuration(dur) {
 // Re-render when section metadata appears (before audio duration is known).
 function _ensureSectionPracticeBar() {
     if (_sectionPracticeSourceSections().length === 0) return;
-    if (_sectionPracticeRanges.length === 0
-        || document.getElementById('section-practice-bar')?.classList.contains('section-practice-bar--hidden')) {
+    if (!_sectionPracticeBarIsReady()) {
         renderSectionPracticeBar();
     }
 }
@@ -6669,7 +7141,7 @@ setInterval(() => {
         }
     }
     _ensureSectionPracticeBar();
-    if (_sectionPracticeRanges.length) {
+    if (_sectionPracticeBarIsReady() && _sectionPracticeSourceSections().length) {
         _updateSectionPracticeHighlight(ct);
     }
     if (!_countingIn) highway.setTime(ct);
@@ -6979,8 +7451,7 @@ window._isShortcutActive = _isShortcutActive;
 // and before any other keydown listeners.
 
 document.addEventListener('keydown', e => {
-    // Don't intercept if typing in an input field
-    if (_isTextInput(e.target) || _isInsideInteractiveControl(e.target)) return;
+    if (_shortcutDispatchBlocked(e)) return;
 
     const ctx = _getCurrentContext();
     const activePanel = _panels.get(_activePanel);

@@ -2693,6 +2693,16 @@ function createHighway() {
         // dragging it would do nothing (filter stays null). Same
         // sentinel, same check, single source of truth.
         hasPhraseData() { return !!(_phrases && _phrases.length > 0); },
+        // Lightweight phrase windows for Section Practice — timing only, no note payloads.
+        getPracticePhrases() {
+            if (!_phrases || !_phrases.length) return null;
+            return _phrases.map((p, index) => ({
+                index,
+                start_time: p.start_time,
+                end_time: p.end_time,
+                max_difficulty: p.max_difficulty,
+            }));
+        },
 
         connect(wsUrl, opts = {}) {
             console.log('[arr] rebuilding transport', wsUrl);

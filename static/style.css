@@ -50,6 +50,9 @@ html { scroll-behavior: smooth; }
     margin: 0 0 4px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.1);
     display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
     min-height: 28px;
     background: rgba(12, 12, 22, 0.98);
 }
@@ -91,6 +94,19 @@ html { scroll-behavior: smooth; }
 
 .section-practice-mode-wrap:has(input:checked) .section-practice-mode-text {
     color: #bbf7d0;
+}
+
+.section-practice-controls-row {
+    flex: 0 0 auto;
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+    width: 100%;
+    min-width: 0;
+}
+
+.section-practice-chips-row {
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .section-practice-row {
@@ -143,6 +159,55 @@ html { scroll-behavior: smooth; }
     color: #cbd5e1;
 }
 
+.section-practice-chip.section-practice-chip--intro:not(.is-selected):not(.is-playing) {
+    background: rgba(100, 116, 139, 0.16);
+    border-color: rgba(100, 116, 139, 0.32);
+    color: #cbd5e1;
+    box-shadow: inset 3px 0 0 rgba(100, 116, 139, 0.62);
+}
+
+.section-practice-chip.section-practice-chip--verse:not(.is-selected):not(.is-playing) {
+    background: rgba(245, 158, 11, 0.14);
+    border-color: rgba(245, 158, 11, 0.32);
+    color: #fcd34d;
+    box-shadow: inset 3px 0 0 rgba(245, 158, 11, 0.62);
+}
+
+.section-practice-chip.section-practice-chip--chorus:not(.is-selected):not(.is-playing) {
+    background: rgba(244, 114, 182, 0.14);
+    border-color: rgba(244, 114, 182, 0.32);
+    color: #f9a8d4;
+    box-shadow: inset 3px 0 0 rgba(244, 114, 182, 0.62);
+}
+
+.section-practice-chip.section-practice-chip--bridge:not(.is-selected):not(.is-playing) {
+    background: rgba(167, 139, 250, 0.14);
+    border-color: rgba(167, 139, 250, 0.32);
+    color: #c4b5fd;
+    box-shadow: inset 3px 0 0 rgba(167, 139, 250, 0.62);
+}
+
+.section-practice-chip.section-practice-chip--solo:not(.is-selected):not(.is-playing) {
+    background: rgba(251, 146, 60, 0.14);
+    border-color: rgba(251, 146, 60, 0.32);
+    color: #fdba74;
+    box-shadow: inset 3px 0 0 rgba(251, 146, 60, 0.62);
+}
+
+.section-practice-chip.section-practice-chip--riff:not(.is-selected):not(.is-playing) {
+    background: rgba(163, 230, 53, 0.12);
+    border-color: rgba(163, 230, 53, 0.3);
+    color: #bef264;
+    box-shadow: inset 3px 0 0 rgba(163, 230, 53, 0.58);
+}
+
+.section-practice-chip.section-practice-chip--outro:not(.is-selected):not(.is-playing) {
+    background: rgba(148, 163, 184, 0.14);
+    border-color: rgba(148, 163, 184, 0.3);
+    color: #cbd5e1;
+    box-shadow: inset 3px 0 0 rgba(148, 163, 184, 0.55);
+}
+
 .section-practice-chip.is-playing {
     color: #e2e8f0;
     border-color: rgba(56, 189, 248, 0.4);
@@ -158,6 +223,60 @@ html { scroll-behavior: smooth; }
 .section-practice-chip.is-playing.is-selected {
     border-color: rgba(74, 222, 128, 0.55);
     box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2);
+}
+
+.section-practice-piece-row {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: flex-start;
+    width: auto;
+    max-width: 100%;
+    margin-left: 2px;
+    padding-left: 8px;
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.section-practice-piece-label {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: #94a3b8;
+    white-space: nowrap;
+    margin-right: 2px;
+}
+
+.section-practice-whole-wrap {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    user-select: none;
+    padding-right: 6px;
+    margin-right: 2px;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.section-practice-whole-wrap input[type="checkbox"] {
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    accent-color: #4ade80;
+    cursor: pointer;
+}
+
+.section-practice-whole-text {
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+    white-space: nowrap;
+}
+
+.section-practice-whole-wrap:has(input:checked) .section-practice-whole-text {
+    color: #bbf7d0;
 }
 
 #player-controls {
