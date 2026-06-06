@@ -4882,6 +4882,8 @@ async function playSong(filename, arrangement, options) {
     _updateSpeedPresetButtons(100);
     _ensureSpeedSliderWired();
     clearLoop();
+    _resetSectionPracticeLog();
+    _hideSectionPracticeBar();
 
     currentFilename = filename;
     // Remember which screen the player was launched from so Esc /
@@ -4906,6 +4908,8 @@ async function playSong(filename, arrangement, options) {
     wsParams.set('naming_mode', _getArrangementNamingMode());
     const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decodeURIComponent(filename)}?${wsParams.toString()}`;
     highway.connect(wsUrl);
+    _resetSectionPracticeLog();
+    _scheduleSectionPracticeRetries();
     loadSavedLoops();
     document.getElementById('quality-select').value = highway.getRenderScale();
 }
@@ -5351,6 +5355,14 @@ if (window.slopsmith) {
     // slopsmith's event bus dispatches CustomEvent with the payload in
     // event.detail (see EventTarget setup around line 699), so the
     // handler receives an Event, not the raw payload.
+    window.slopsmith.on('song:ready', () => {
+        _resetSectionPracticeLog();
+        renderSectionPracticeBar();
+        _scheduleSectionPracticeRetries();
+    });
+    window.slopsmith.on('song:loaded', () => {
+        _scheduleSectionPracticeRetries();
+    });
     window.slopsmith.on('song:ready', (e) => {
         _applyMasteryAvailability(!!e.detail?.hasPhraseData);
         // Auto mode: re-evaluate the active renderer against the
@@ -5880,6 +5892,7 @@ let loopA = null;
 let loopB = null;
 
 function setLoopStart() {
+    _setSectionPracticeMode(false, { skipClearLoop: true });
     loopA = _audioTime();
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
@@ -5895,6 +5908,7 @@ function setLoopEnd() {
 
 function clearLoop(options) {
     const { emitTransportEvent = true } = options || {};
+    _setSectionPracticeMode(false, { skipClearLoop: true });
     // playSong() clears the loop on every song load, so only signal a
     // loop-cleared transport event when a loop was actually active —
     // otherwise every song switch emits a spurious playback:loop-cleared.
@@ -5907,6 +5921,8 @@ function clearLoop(options) {
     document.getElementById('btn-loop-save').classList.add('hidden');
     document.getElementById('loop-label').textContent = '';
     document.getElementById('saved-loops').value = '';
+    _sectionPracticeSelected = -1;
+    _updateSectionPracticeHighlight(_audioTime());
     if (hadLoop && emitTransportEvent && typeof window !== 'undefined') {
         window.slopsmith?.playback?.transportEvent?.('loop-cleared', {
             requesterId: 'core.loop',
@@ -5990,6 +6006,363 @@ function updateLoopUI() {
         document.getElementById('btn-loop-save').classList.add('hidden');
     } else {
         label.textContent = '';
+    }
+    _syncSectionPracticeFromLoop();
+}
+
+// ── Section Practice Bar ────────────────────────────────────────────────
+// One-click looping over Rocksmith section markers (highway.getSections —
+// same array as 3D highway bundle.sections / "Now / Up Next").
+// Reuses setLoop() so manual A/B controls and saved loops stay canonical.
+let _sectionPracticeRanges = [];
+let _sectionPracticeSelected = -1;
+let _sectionPracticePlaying = -1;
+let _sectionPracticeDurSynced = false;
+let _sectionPracticeLogged = false;
+let _sectionPracticeHooked = false;
+let _sectionPracticeRetryTimer = null;
+let _sectionPracticeMode = false;
+
+function _setSectionPracticeMode(on, opts = {}) {
+    const next = !!on;
+    if (next === _sectionPracticeMode && !opts.force) return;
+    _sectionPracticeMode = next;
+    const cb = document.getElementById('section-practice-mode');
+    if (cb) cb.checked = _sectionPracticeMode;
+    const bar = document.getElementById('section-practice-bar');
+    if (bar) bar.classList.toggle('section-practice-bar--mode-on', _sectionPracticeMode);
+    if (_sectionPracticeMode) {
+        console.log('[section-practice] mode on');
+    } else {
+        console.log('[section-practice] mode off');
+        _sectionPracticeSelected = -1;
+        _updateSectionPracticeHighlight(_audioTime());
+        if (!opts.skipClearLoop && (loopA !== null || loopB !== null)) {
+            clearLoop();
+        }
+    }
+}
+
+function onSectionPracticeModeChange() {
+    const cb = document.getElementById('section-practice-mode');
+    if (!cb) return;
+    _setSectionPracticeMode(cb.checked);
+}
+
+function _resetSectionPracticeLog() {
+    _sectionPracticeLogged = false;
+}
+
+function _sectionPracticeHighway() {
+    return window.highway || (typeof highway !== 'undefined' ? highway : null);
+}
+
+function _sectionPracticeDuration() {
+    const d = _audioDuration();
+    if (d && Number.isFinite(d) && d > 0) return d;
+    const cd = window.slopsmith?.currentSong?.duration;
+    return (cd && Number.isFinite(cd) && cd > 0) ? cd : 0;
+}
+
+function _sectionPracticeSourceSections() {
+    const hw = _sectionPracticeHighway();
+    if (!hw || typeof hw.getSections !== 'function') return [];
+    const raw = hw.getSections();
+    return Array.isArray(raw) ? raw : [];
+}
+
+function _sectionPracticeStartTime(s) {
+    const t = s.time ?? s.startTime ?? s.start_time ?? s.start;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : NaN;
+}
+
+function _sectionPracticeBaseName(rawName, fallbackIndex) {
+    let s = (typeof rawName === 'string' ? rawName : '').trim();
+    if (!s) s = `Section ${fallbackIndex + 1}`;
+    // Normalise separators and strip common trailing digits like "Chorus 2"
+    s = s.replace(/_/g, ' ');
+    s = s.replace(/\s*\d+$/u, '');
+    const lower = s.toLowerCase();
+    const canonical = {
+        intro: 'Intro',
+        verse: 'Verse',
+        chorus: 'Chorus',
+        bridge: 'Bridge',
+        solo: 'Solo',
+        riff: 'Riff',
+        outro: 'Outro',
+    }[lower];
+    if (canonical) return canonical;
+    // Fallback: title-case words
+    return lower.split(/\s+/).filter(Boolean).map(w => w[0].toUpperCase() + w.slice(1)).join(' ') || `Section ${fallbackIndex + 1}`;
+}
+
+function _buildSectionPracticeRanges() {
+    const raw = _sectionPracticeSourceSections();
+    if (!raw.length) return [];
+    const dur = _sectionPracticeDuration();
+    const sorted = [...raw].sort((a, b) => _sectionPracticeStartTime(a) - _sectionPracticeStartTime(b));
+    // Step 1: collapse consecutive same-name markers into logical groups.
+    const groups = [];
+    for (let i = 0; i < sorted.length; i++) {
+        const start = _sectionPracticeStartTime(sorted[i]);
+        if (!Number.isFinite(start)) continue;
+        const baseName = _sectionPracticeBaseName(sorted[i].name, groups.length);
+        const prev = groups[groups.length - 1];
+        if (prev && prev.baseName === baseName) {
+            prev.lastIndex = i;
+        } else {
+            groups.push({ baseName, firstIndex: i, lastIndex: i });
+        }
+    }
+    if (!groups.length) return [];
+    // Step 2: assign musician-friendly labels with counters (Verse 1, Verse 2, …).
+    const counters = Object.create(null);
+    const ranges = [];
+    for (let gi = 0; gi < groups.length; gi++) {
+        const g = groups[gi];
+        const base = g.baseName;
+        const count = (counters[base] || 0) + 1;
+        counters[base] = count;
+        const label = `${base} ${count}`;
+        const firstSec = sorted[g.firstIndex];
+        const start = _sectionPracticeStartTime(firstSec);
+        if (!Number.isFinite(start)) continue;
+        let end;
+        if (gi + 1 < groups.length) {
+            const nextFirst = sorted[groups[gi + 1].firstIndex];
+            end = _sectionPracticeStartTime(nextFirst);
+        } else {
+            end = dur;
+        }
+        if (!Number.isFinite(end) || end <= start) {
+            end = dur > start ? dur : start + 4;
+        }
+        ranges.push({ name: label, start, end });
+    }
+    return ranges;
+}
+
+function _formatSectionPracticeName(name) {
+    return name.replace(/_/g, ' ');
+}
+
+function _ensureSectionPracticeDom() {
+    let bar = document.getElementById('section-practice-bar');
+    if (bar) return bar;
+    const controls = document.getElementById('player-controls');
+    if (!controls) return null;
+    bar = document.createElement('div');
+    bar.id = 'section-practice-bar';
+    bar.className = 'section-practice-bar section-practice-bar--hidden';
+    bar.setAttribute('aria-label', 'Section practice');
+    bar.innerHTML = '<div class="section-practice-row">'
+        + '<label class="section-practice-mode-wrap" title="Loop the selected section until turned off">'
+        + '<input type="checkbox" id="section-practice-mode" onchange="onSectionPracticeModeChange()">'
+        + '<span class="section-practice-mode-text">Practice Section</span>'
+        + '</label>'
+        + '<span class="section-practice-label">Sections:</span>'
+        + '<div id="section-practice-scroll" class="section-practice-scroll" role="toolbar"></div>'
+        + '</div>';
+    controls.insertBefore(bar, controls.firstChild);
+    return bar;
+}
+
+function _showSectionPracticeBar(bar) {
+    bar.classList.remove('section-practice-bar--hidden');
+    bar.style.display = 'flex';
+}
+
+function _hideSectionPracticeBar() {
+    _setSectionPracticeMode(false, { skipClearLoop: true });
+    const bar = document.getElementById('section-practice-bar');
+    if (bar) {
+        bar.classList.add('section-practice-bar--hidden');
+        bar.style.display = 'none';
+    }
+    _sectionPracticeRanges = [];
+    _sectionPracticeSelected = -1;
+    _sectionPracticePlaying = -1;
+    _sectionPracticeDurSynced = false;
+    const scroll = document.getElementById('section-practice-scroll');
+    if (scroll) scroll.innerHTML = '';
+}
+
+function _installSectionPracticeDrawHook() {
+    if (_sectionPracticeHooked) return;
+    const hw = _sectionPracticeHighway();
+    if (!hw || typeof hw.addDrawHook !== 'function') return;
+    _sectionPracticeHooked = true;
+    hw.addDrawHook(() => {
+        if (_sectionPracticeRanges.length > 0) return;
+        if (_sectionPracticeSourceSections().length > 0) {
+            renderSectionPracticeBar();
+        }
+    });
+}
+
+function _scheduleSectionPracticeRetries() {
+    if (_sectionPracticeRetryTimer) clearTimeout(_sectionPracticeRetryTimer);
+    const delays = [0, 50, 200, 500, 1200];
+    let i = 0;
+    const tick = () => {
+        renderSectionPracticeBar();
+        i += 1;
+        if (i < delays.length && _sectionPracticeRanges.length === 0) {
+            _sectionPracticeRetryTimer = setTimeout(tick, delays[i]);
+        } else {
+            _sectionPracticeRetryTimer = null;
+        }
+    };
+    tick();
+}
+
+function renderSectionPracticeBar() {
+    _installSectionPracticeDrawHook();
+    const raw = _sectionPracticeSourceSections();
+    if (!_sectionPracticeLogged) {
+        console.log(`[section-practice] sections found: ${raw.length}`);
+        _sectionPracticeLogged = true;
+    }
+    _sectionPracticeRanges = _buildSectionPracticeRanges();
+    const bar = _ensureSectionPracticeDom();
+    const scroll = document.getElementById('section-practice-scroll');
+    if (!bar || !scroll) return;
+    if (_sectionPracticeRanges.length === 0) {
+        _hideSectionPracticeBar();
+        return;
+    }
+    _showSectionPracticeBar(bar);
+    scroll.innerHTML = _sectionPracticeRanges.map((r, i) => {
+        const label = _formatSectionPracticeName(r.name);
+        const tip = `${label} (${formatTime(r.start)}–${formatTime(r.end)})`;
+        return `<button type="button" class="section-practice-chip" data-section-idx="${i}" title="${esc(tip)}" onclick="practiceSection(${i})">${esc(label)}</button>`;
+    }).join('');
+    _syncSectionPracticeFromLoop();
+    _updateSectionPracticeHighlight(_audioTime());
+}
+
+function _sectionPracticeLoopIndex() {
+    if (loopA === null || loopB === null) return -1;
+    for (let i = 0; i < _sectionPracticeRanges.length; i++) {
+        const r = _sectionPracticeRanges[i];
+        if (Math.abs(r.start - loopA) < 0.05 && Math.abs(r.end - loopB) < 0.05) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+async function practiceSection(index) {
+    const r = _sectionPracticeRanges[index];
+    if (!r) return;
+    const dur = _sectionPracticeDuration();
+    const start = Number(r.start);
+    let end = Number(r.end);
+    if (dur && Number.isFinite(dur) && end > dur) end = dur;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+
+    console.log('[section-practice] click', { name: r.name, start, end });
+    _cancelCountIn();
+    _setSectionPracticeMode(true, { skipClearLoop: true });
+
+    // setLoop() is seek-gated: it returns false when the seek is cancelled
+    // during arrangement switches / teardown-gen bumps, or when the backend
+    // clock clamps off-target. Retry briefly to land after the transport
+    // becomes ready without forking the loop system.
+    let ok = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            ok = await setLoop(start, end);
+        } catch (err) {
+            console.warn('[section-practice] setLoop threw:', err);
+            ok = false;
+        }
+        if (ok) break;
+        await new Promise(res => setTimeout(res, 60 + attempt * 90));
+    }
+
+    if (ok) {
+        _sectionPracticeSelected = index;
+        _updateSectionPracticeHighlight(_audioTime());
+        console.log('[section-practice] loop set', {
+            loopA,
+            loopB,
+            loopEnabled: (loopA !== null && loopB !== null),
+        });
+        console.log('[section-practice] count-in requested');
+        startCountIn({ immediate: true });
+    } else {
+        _setSectionPracticeMode(false, { skipClearLoop: true });
+        console.log('[section-practice] loop set', { loopA, loopB, loopEnabled: false });
+    }
+}
+
+function _syncSectionPracticeFromLoop() {
+    if (!_sectionPracticeRanges.length) return;
+    const match = _sectionPracticeLoopIndex();
+    _sectionPracticeSelected = match;
+    if (loopA !== null && loopB !== null) {
+        if (match >= 0) {
+            if (!_sectionPracticeMode) {
+                _setSectionPracticeMode(true, { skipClearLoop: true });
+            }
+        } else if (_sectionPracticeMode) {
+            _setSectionPracticeMode(false, { skipClearLoop: true });
+        }
+    } else if (_sectionPracticeMode) {
+        _setSectionPracticeMode(false, { skipClearLoop: true });
+    }
+    _updateSectionPracticeHighlight(_audioTime());
+}
+
+function _sectionPracticeIndexAtTime(t) {
+    if (!Number.isFinite(t) || _sectionPracticeRanges.length === 0) return -1;
+    for (let i = _sectionPracticeRanges.length - 1; i >= 0; i--) {
+        if (t >= _sectionPracticeRanges[i].start) return i;
+    }
+    return -1;
+}
+
+function _updateSectionPracticeHighlight(ct) {
+    const scroll = document.getElementById('section-practice-scroll');
+    if (!scroll || _sectionPracticeRanges.length === 0) return;
+    const playing = _sectionPracticeIndexAtTime(ct);
+    const chips = scroll.querySelectorAll('.section-practice-chip');
+    chips.forEach((chip, i) => {
+        chip.classList.toggle('is-playing', i === playing);
+        chip.classList.toggle('is-selected', i === _sectionPracticeSelected);
+    });
+    if (playing !== _sectionPracticePlaying) {
+        _sectionPracticePlaying = playing;
+        if (playing >= 0) {
+            const active = scroll.querySelector(`[data-section-idx="${playing}"]`);
+            active?.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
+        }
+    }
+}
+
+function _maybeRefreshSectionPracticeDuration(dur) {
+    if (_sectionPracticeDurSynced || !dur || _sectionPracticeRanges.length === 0) return;
+    const rebuilt = _buildSectionPracticeRanges();
+    if (!rebuilt.length) return;
+    const prevEnd = _sectionPracticeRanges[_sectionPracticeRanges.length - 1].end;
+    const nextEnd = rebuilt[rebuilt.length - 1].end;
+    if (Math.abs(prevEnd - nextEnd) > 0.05) {
+        _sectionPracticeDurSynced = true;
+        renderSectionPracticeBar();
+    } else {
+        _sectionPracticeDurSynced = true;
+    }
+}
+
+// Re-render when section metadata appears (before audio duration is known).
+function _ensureSectionPracticeBar() {
+    if (_sectionPracticeSourceSections().length === 0) return;
+    if (_sectionPracticeRanges.length === 0
+        || document.getElementById('section-practice-bar')?.classList.contains('section-practice-bar--hidden')) {
+        renderSectionPracticeBar();
     }
 }
 
@@ -6119,19 +6492,80 @@ function hideCountOverlay() {
     if (_countOverlay) { _countOverlay.remove(); _countOverlay = null; }
 }
 
-async function startCountIn() {
+async function startCountIn(opts = {}) {
     if (_countingIn) return;
     _countingIn = true;
+    const immediate = !!opts.immediate;
     // Snapshot the current gen so every delayed callback (rewind frames,
     // post-seek then, count-in ticks, post-count play) can bail if a
     // teardown bumped the gen mid-flight via _cancelCountIn().
     const gen = _countInGen;
+
+    function beginCount() {
+        const bpm = highway.getBPM(loopA);
+        const beatInterval = 60 / bpm;
+        let count = 0;
+
+        function tick() {
+            if (gen !== _countInGen) return; // teardown mid-count
+            count++;
+            if (count > 4) {
+                hideCountOverlay();
+                _countingIn = false;
+                if (window._juceMode) {
+                    jucePlayer.play().then((started) => {
+                        if (gen !== _countInGen) return; // teardown during play start
+                        if (!started) return;
+                        isPlaying = true;
+                        setPlayButtonState(true);
+                        window.slopsmith.isPlaying = true;
+                        const payload = _songEventPayload();
+                        window.slopsmith.emit('song:play', payload);
+                        window.slopsmith.emit('song:resume', payload);
+                    }).catch((err) => console.error('[app] jucePlayer.play error:', err));
+                } else if (audio.src && audio.src !== window.location.href) {
+                    audio.play().then(() => {
+                        if (gen !== _countInGen) return;
+                        isPlaying = true;
+                        setPlayButtonState(true);
+                    }).catch((err) => {
+                        if (gen !== _countInGen) return;
+                        console.error('[app] audio.play() rejected after count-in:', err);
+                        isPlaying = false;
+                        setPlayButtonState(false);
+                    });
+                }
+                return;
+            }
+            showCountOverlay(count);
+            playClick(count === 1);
+            _countInTimer = setTimeout(tick, beatInterval * 1000);
+        }
+        _countInTimer = setTimeout(tick, 500);
+    }
+
     if (window._juceMode) {
         await jucePlayer.pause().catch((err) => console.error('[app] jucePlayer.pause error in count-in:', err));
     } else {
         audio.pause();
     }
     if (gen !== _countInGen) return; // teardown during pause
+
+    // Section-practice entry: already at loop A after setLoop(); skip the
+    // B→A rewind animation used on loop wrap and go straight to clicks.
+    if (immediate) {
+        if (loopA === null || loopB === null) {
+            _countingIn = false;
+            return;
+        }
+        lastAudioTime = loopA;
+        highway.setTime(loopA);
+        if (window.slopsmith) {
+            window.slopsmith.emit('loop:restart', { loopA, loopB, time: loopA });
+        }
+        beginCount();
+        return;
+    }
 
     // Rewind animation: sweep highway time from B to A
     const rewindDuration = 400; // ms
@@ -6198,51 +6632,6 @@ async function startCountIn() {
         }
     }
     _countInRaf = requestAnimationFrame(rewindStep);
-
-    function beginCount() {
-        const bpm = highway.getBPM(loopA);
-        const beatInterval = 60 / bpm;
-        let count = 0;
-
-        function tick() {
-            if (gen !== _countInGen) return; // teardown mid-count
-            count++;
-            if (count > 4) {
-                hideCountOverlay();
-                _countingIn = false;
-                if (window._juceMode) {
-                    jucePlayer.play().then((started) => {
-                        if (gen !== _countInGen) return; // teardown during play start
-                        if (!started) return;
-                        isPlaying = true;
-                        setPlayButtonState(true);
-                        window.slopsmith.isPlaying = true;
-                        const payload = _songEventPayload();
-                        window.slopsmith.emit('song:play', payload);
-                        window.slopsmith.emit('song:resume', payload);
-                    }).catch((err) => console.error('[app] jucePlayer.play error:', err));
-                } else if (audio.src && audio.src !== window.location.href) {
-                    audio.play().then(() => {
-                        if (gen !== _countInGen) return;
-                        isPlaying = true;
-                        setPlayButtonState(true);
-                    }).catch((err) => {
-                        if (gen !== _countInGen) return;
-                        // Same rationale as togglePlay: don't claim playback
-                        // started if the Promise rejected.
-                        console.error('[app] audio.play() rejected after count-in:', err);
-                        isPlaying = false;
-                        setPlayButtonState(false);
-                    });
-                }
-                return;
-            }
-            showCountOverlay(count);
-            playClick(count === 1);
-            _countInTimer = setTimeout(tick, beatInterval * 1000);
-        }
-        _countInTimer = setTimeout(tick, 500);
-    }
 }
 
 // Time display + highway sync
@@ -6275,9 +6664,18 @@ setInterval(() => {
         }
         lastAudioTime = ct;
         document.getElementById('hud-time').textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
+        if (dur) {
+            _maybeRefreshSectionPracticeDuration(dur);
+        }
+    }
+    _ensureSectionPracticeBar();
+    if (_sectionPracticeRanges.length) {
+        _updateSectionPracticeHighlight(ct);
     }
     if (!_countingIn) highway.setTime(ct);
 }, 1000 / 60);
+
+_installSectionPracticeDrawHook();
 
 // ── Centralized Keyboard Shortcut Registry ───────────────────────────────
 //
